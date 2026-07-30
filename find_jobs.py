@@ -601,6 +601,11 @@ def extract_job_details_from_link(href, text, source_name):
     if not text_clean or len(text_clean) < 3:
         return None
 
+    # Ignore Builtin category/listing pages or awards pages that are not individual job postings
+    if "builtin.com" in url_lower:
+        if re.search(r'builtin\.com/jobs(?:/|\?|$)', url_lower) or any(p in url_lower for p in ["/awards", "/companies", "/salaries", "/tech-"]):
+            return None
+
     # 1. Non-job URL blacklist (including corporate SaaS marketing paths & external news/media domains)
     ignored_url_patterns = [
         "/categories", "/investors", "/stages", "/industries", "/locations",
@@ -637,9 +642,10 @@ def extract_job_details_from_link(href, text, source_name):
         "talent matching", "onboarding", "reporting & insights", "integrations",
         "early-stage business", "scaling company", "modern enterprise", "job seekers",
         "how we compare", "return on your hiring", "your partner in success", "guidance",
-        "source", "link", "see all investors", "categories", "explore", "sponsor", "investors"
+        "source", "link", "see all investors", "categories", "explore", "sponsor", "investors",
+        "best places to work", "explore companies hiring", "see all remote tech jobs"
     ]
-    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at", "request a demo", "skip to content", "see all investors"]):
+    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at", "request a demo", "skip to content", "see all investors", "best places to work", "tech jobs & startup jobs"]):
         return None
 
     company = ""
@@ -668,7 +674,7 @@ def extract_job_details_from_link(href, text, source_name):
         "anthropic": "Anthropic"
     }
 
-    # A. Extract Company from ATS URL structure if present
+    # A. Extract Company from ATS / Job Board URL structure if present
     # Greenhouse: job-boards.greenhouse.io/<company_slug>/jobs/<id>
     gh_match = re.search(r'greenhouse\.io/([^/]+)/jobs/', href, re.IGNORECASE)
     if not gh_match:
@@ -692,23 +698,30 @@ def extract_job_details_from_link(href, text, source_name):
             company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
 
     # Built In job URLs: builtin.com/company/<slug>/jobs/ or builtin.com/job/...
-    if not company:
+    if not company and "builtin.com" in url_lower:
         bi_match = re.search(r'builtin\.com/company/([^/]+)/', href, re.IGNORECASE)
         if bi_match:
             slug = bi_match.group(1).lower()
             company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
 
-    # B. Parse structured link text (e.g. "TitleCompany · Location · Date")
+    # B. Parse structured link text (e.g. "Title · Company · Location", "Title · Location", "Title - Company")
     parts = [p.strip() for p in text_clean.split("·") if p.strip()]
-    if len(parts) >= 2:
+    if len(parts) >= 3:
+        title = parts[0]
+        if not company:
+            company = parts[1].title()
+        location = parts[2]
+    elif len(parts) == 2:
         if parts[-1].lower().startswith("posted on"):
             parts.pop()
         
         if len(parts) >= 2 and any(loc_kw in parts[-1].lower() for loc_kw in ["remote", "hybrid", "on-site", "united states", "canada", "sf", "ny", "ca", "tx", "wa", "ma", "co"]):
             location = parts[-1]
-            title_part = " · ".join(parts[:-1])
+            title_part = parts[0]
         else:
             title_part = parts[0]
+            if not company:
+                company = parts[1].title()
 
         if company:
             comp_pattern = re.escape(company)
@@ -744,15 +757,24 @@ def extract_job_details_from_link(href, text, source_name):
 
     title = re.sub(r'\s+', ' ', title).strip(" -|·")
 
+    # If company is still empty, check URL netloc ONLY if netloc is not a known job board / aggregator domain
     if not company:
+        source_norm = source_name.lower().replace(" ", "").replace("-", "").replace("_", "")
         parsed_url = urllib.parse.urlparse(href)
-        if parsed_url.netloc and source_name.lower() not in parsed_url.netloc.lower():
+        netloc_norm = parsed_url.netloc.lower().replace(" ", "").replace("-", "").replace("_", "")
+        if parsed_url.netloc and source_norm not in netloc_norm:
             host_parts = parsed_url.netloc.split(".")
             if len(host_parts) >= 2:
                 company = host_parts[-2].capitalize()
 
-    # Discard any entry where real company could not be resolved or is a generic placeholder
-    if not company or company.lower() in ("greenhouse", "ashby", "lever", "company", "unknown") or company.startswith("Company via"):
+    # Discard any entry where real company could not be resolved or is a generic/job board placeholder
+    FORBIDDEN_COMPANIES = {
+        "greenhouse", "ashby", "lever", "company", "unknown", "builtin", "built in",
+        "indeed", "wellfound", "crunchbase", "workday", "startups gallery",
+        "startups gallery jobs", "job board", "techcrunch", "venturebeat", "linkedin",
+        "glassdoor", "ziprecruiter", "simplyhired", "monster"
+    }
+    if not company or company.lower() in FORBIDDEN_COMPANIES or company.startswith("Company via"):
         return None
 
     if len(title) < 4:
@@ -894,62 +916,121 @@ def discover_raw_jobs_for_company(company, direct_keywords):
 
 # --- Filtering & Deduplication ---
 
-def is_matching_role(title, filter_criteria):
+def evaluate_role_match(title, filter_criteria):
+    """
+    Evaluates if title matches PM target roles.
+    Returns (is_match: bool, reason: str).
+    """
     t = title.lower()
 
     exclude_mgmt = filter_criteria.get("exclude_management_keywords", [])
-    if any(rej in t for rej in exclude_mgmt if rej):
-        return False
+    for rej in exclude_mgmt:
+        if rej and rej.lower() in t:
+            return False, f"Excluded Management Keyword ('{rej}' in title)"
 
     exclude_roles = filter_criteria.get("exclude_role_keywords", [])
-    if any(rej in t for rej in exclude_roles if rej):
-        return False
+    for rej in exclude_roles:
+        if rej and rej.lower() in t:
+            return False, f"Excluded Role Keyword ('{rej}' in title)"
 
     include_patterns = filter_criteria.get("include_role_patterns", [])
     if include_patterns:
         matches_pattern = any(re.search(pat, t, re.IGNORECASE) for pat in include_patterns)
         if not matches_pattern:
-            return False
+            return False, f"Role Mismatch (title '{title}' does not match target PM patterns)"
 
-    return True
+    return True, "Role Matched"
 
-def is_eligible_location(loc_str, title_str, filter_criteria):
+def is_matching_role(title, filter_criteria):
+    matched, _ = evaluate_role_match(title, filter_criteria)
+    return matched
+
+def evaluate_location_eligibility(loc_str, title_str, filter_criteria):
+    """
+    Evaluates location eligibility based on US target geography.
+    Returns (is_eligible: bool, reason: str).
+    """
     title_lower = str(title_str).lower()
     loc_lower = str(loc_str).lower()
 
     excluded_locs = filter_criteria.get("excluded_location_keywords", [])
     allowed_locs = filter_criteria.get("allowed_location_keywords", [])
 
-    if any(term in title_lower for term in excluded_locs if len(term) > 3):
-        return False
+    for term in excluded_locs:
+        if len(term) > 3 and term.lower() in title_lower:
+            return False, f"Excluded Region in Title ('{term}' in title)"
 
     has_allowed = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in allowed_locs if term)
     
     if loc_str in ('US (Remote / On-site)', 'US / Unspecified') or has_allowed:
-        return True
+        return True, "US Eligible Location"
 
     has_excluded = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in excluded_locs if term)
     if has_excluded and not has_allowed:
-        return False
+        return False, f"Non-US Location ('{loc_str}' contains excluded region)"
 
-    return True
+    return False, f"Ineligible Location ('{loc_str}' not in allowed US target geographies)"
 
-def calculate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+def is_eligible_location(loc_str, title_str, filter_criteria):
+    eligible, _ = evaluate_location_eligibility(loc_str, title_str, filter_criteria)
+    return eligible
+
+def evaluate_salary_eligibility(comp_str, filter_criteria):
+    """
+    Evaluates salary eligibility against min_base_salary_usd.
+    Returns (is_eligible: bool, reason: str).
+    """
+    if not comp_str:
+        return True, "Salary Unspecified"
+
+    min_sal = filter_criteria.get("min_base_salary_usd", 200000)
+    matches = re.findall(r'\$(\d{1,3}(?:,\d{3})*|\d+)\s*(k|thousand)?', comp_str, re.IGNORECASE)
+    if matches:
+        amounts = []
+        for val, mult in matches:
+            val_num = int(val.replace(",", ""))
+            if mult.lower() == "k":
+                val_num *= 1000
+            if val_num < 1000 and val_num > 0:
+                val_num *= 1000
+            amounts.append(val_num)
+        if amounts:
+            max_amount = max(amounts)
+            if max_amount < min_sal:
+                return False, f"Salary Too Low ({comp_str} < ${min_sal:,} min base)"
+
+    return True, "Salary Eligible"
+
+def evaluate_company_eligibility(company_name, filter_criteria):
+    """
+    Evaluates company against excluded company list.
+    Returns (is_eligible: bool, reason: str).
+    """
+    excluded_comps = filter_criteria.get("excluded_company_names", [])
+    for ex in excluded_comps:
+        if ex and ex.lower() in company_name.lower():
+            return False, f"Excluded Company ('{company_name}' matches excluded company '{ex}')"
+    return True, "Company Eligible"
+
+def evaluate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+    """
+    Calculates fit score and returns (score: int, details: str).
+    """
     fit_cfg = filter_criteria.get("fit_scoring", {})
     base_score = fit_cfg.get("base_score", 50)
     score = base_score
     combined = (title + " " + domain_text).lower()
 
-    excluded_comps = filter_criteria.get("excluded_company_names", [])
-    if any(ex.lower() in company_name.lower() for ex in excluded_comps if ex):
-        return 0
+    reasons = []
 
     keyword_boosts = fit_cfg.get("keyword_boosts", [])
     for boost in keyword_boosts:
         weight = boost.get("weight", 10)
         patterns = boost.get("patterns", [])
-        if any(re.search(r'\b' + re.escape(p.lower()) + r'\b', combined) for p in patterns):
+        matched_pats = [p for p in patterns if re.search(r'\b' + re.escape(p.lower()) + r'\b', combined)]
+        if matched_pats:
             score += weight
+            reasons.append(f"+{weight}% for '{matched_pats[0]}'")
 
     comp_boost_cfg = fit_cfg.get("compensation_boost", {})
     min_sal = comp_boost_cfg.get("min_salary", 200000)
@@ -957,8 +1038,15 @@ def calculate_fit_score(title, domain_text, comp_text, company_name, filter_crit
 
     if str(min_sal) in comp_text or "$200k" in comp_text.lower() or "$2" in comp_text:
         score += weight
+        reasons.append(f"+{weight}% for comp ${min_sal:,}+")
 
-    return min(100, max(0, score))
+    final_score = min(100, max(0, score))
+    detail_str = f"boosts: {', '.join(reasons)}" if reasons else "no keyword/comp boosts matched"
+    return final_score, detail_str
+
+def calculate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+    score, _ = evaluate_fit_score(title, domain_text, comp_text, company_name, filter_criteria)
+    return score
 
 def extract_job_id_from_url(url):
     if not url:
@@ -1149,29 +1237,38 @@ def collect_all_raw_jobs(config, max_new_companies=100):
     return raw_jobs
 
 def filter_and_score_jobs(raw_jobs, filter_criteria):
-    """Step 2: Apply role matching, location eligibility, and fit score threshold evaluation."""
+    """Step 2: Apply role matching, location eligibility, salary, company & fit score evaluation with detailed rejection reasons."""
     threshold = filter_criteria.get("fit_scoring", {}).get("fit_score_threshold_percent", 75)
     filtered_jobs = []
     step2_evaluations = []
 
     for j in raw_jobs:
-        role_pass = is_matching_role(j["title"], filter_criteria)
-        loc_pass = is_eligible_location(j["location"], j["title"], filter_criteria)
+        comp_pass, comp_reason = evaluate_company_eligibility(j["company"], filter_criteria)
+        role_pass, role_reason = evaluate_role_match(j["title"], filter_criteria)
+        loc_pass, loc_reason = evaluate_location_eligibility(j["location"], j["title"], filter_criteria)
+        sal_pass, sal_reason = evaluate_salary_eligibility(j.get("comp", ""), filter_criteria)
 
+        rejection_reasons = []
+        if not comp_pass:
+            rejection_reasons.append(comp_reason)
         if not role_pass:
-            status = "Rejected (Role Mismatch)"
-            is_passed = False
-        elif not loc_pass:
-            status = "Rejected (Location Non-US)"
+            rejection_reasons.append(role_reason)
+        if not loc_pass:
+            rejection_reasons.append(loc_reason)
+        if not sal_pass:
+            rejection_reasons.append(sal_reason)
+
+        if rejection_reasons:
+            status = f"Rejected ({'; '.join(rejection_reasons)})"
             is_passed = False
         else:
-            score = calculate_fit_score(j["title"], j["domain"], j["comp"], j["company"], filter_criteria)
+            score, score_detail = evaluate_fit_score(j["title"], j["domain"], j.get("comp", ""), j["company"], filter_criteria)
             if score >= threshold:
                 status = f"PASSED ({score}%)"
                 is_passed = True
                 filtered_jobs.append(j)
             else:
-                status = f"Rejected (Low Fit Score: {score}%)"
+                status = f"Rejected (Low Fit Score: {score}% < {threshold}% - {score_detail})"
                 is_passed = False
 
         step2_evaluations.append({
