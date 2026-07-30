@@ -1,0 +1,35 @@
+# Python / Virtual Environment
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment & Local Configuration
+.env
+.env.local
+.env.*
+!.env.example
+
+# Personal Files & User Data Folders
+personal-files/*
+!personal-files/sources.example.json
+!personal-files/.gitkeep
+
+# Output files & Logs
+logs/
+*.log
+job-leads.md
+Pipeline.md
+Profile.md
+sources.json
+step1.md
+step2.md
+step3.md
+
+# OS & Editor specific
+.DS_Store
+.vscode/
+.idea/
