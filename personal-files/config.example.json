@@ -1,0 +1,87 @@
+{
+  "_comment": "Configuration file for Job Discovery Engine. Fully customizable for any profession (Product Management, Software Engineering, Data Science, Design, etc.), level (IC, Staff, Executive), and location.",
+  "job_sources": [
+    { "name": "Ashby", "url": "https://jobs.ashbyhq.com", "type": "ats_board" },
+    { "name": "Greenhouse", "url": "https://job-boards.greenhouse.io", "type": "ats_board" },
+    { "name": "Lever", "url": "https://api.lever.co/v0/postings", "type": "ats_board" },
+    { "name": "Wellfound", "url": "https://wellfound.com/jobs", "type": "job_board" }
+  ],
+  "funding_news_sources": [
+    { "name": "TechCrunch", "url": "https://techcrunch.com/category/startups/", "type": "tech_news" },
+    { "name": "VentureBeat", "url": "https://venturebeat.com/category/ai/", "type": "tech_news" },
+    { "name": "Crunchbase News", "url": "https://news.crunchbase.com/", "type": "funding_news" }
+  ],
+  "filter_criteria": {
+    "role_category_label": "Individual Contributor (IC) Senior Product Management",
+    "include_role_patterns": [
+      "\\b(principal|staff|senior|sr\\.?|lead)?\\s*(product\\s*manager|product\\s*lead|pm)\\b",
+      "\\bresearch\\s+product\\s+manager\\b",
+      "\\bdeployed\\s+product\\s+manager\\b",
+      "\\bai\\s+product\\s+manager\\b"
+    ],
+    "exclude_role_keywords": [
+      "sales development", "business development", "account executive", 
+      "product marketing", "product designer", "program manager", "software engineer", "recruiter", "analyst"
+    ],
+    "exclude_management_keywords": [
+      "director", "vp of", "vp,", "head of", "group product manager", "gpm", "people manager"
+    ],
+    "direct_career_site_keywords": [
+      "product manager", "product lead", "staff pm", "principal pm", "senior pm"
+    ],
+    "excluded_company_names": [
+      "meta", "facebook", "amazon"
+    ],
+    "target_geography": "US (On-site, Remote, Hybrid open)",
+    "allowed_location_keywords": [
+      "us", "united states", "ca", "ny", "wa", "tx", "ma", "co", "dc", "il", "va", "ga", "fl",
+      "san francisco", "new york", "austin", "seattle", "boston", "chicago", "denver", "washington",
+      "remote - us", "us (remote", "remote (us)", "us /", "/ us"
+    ],
+    "excluded_location_keywords": [
+      "london", "uk", "germany", "berlin", "france", "sydney", "australia", "canada", "toronto", 
+      "vancouver", "singapore", "japan", "india", "emea", "apac", "latam", "europe"
+    ],
+    "min_base_salary_usd": 200000,
+    "min_valuation_usd": 100000000,
+    "funding_lookback_months": 6,
+    "eligible_funding_stages": ["Series B", "Series C", "Series D", "Series E", "Series F", "Growth", "Late Stage", "Public"],
+    "fit_scoring": {
+      "base_score": 50,
+      "fit_score_threshold_percent": 75,
+      "keyword_boosts": [
+        { "weight": 25, "patterns": ["agentic", "agent", "agents", "ai agent", "ai agents", "evals", "evaluation", "eval"] },
+        { "weight": 18, "patterns": ["ai", "llm", "machine learning", "genai", "generative ai"] },
+        { "weight": 15, "patterns": ["principal", "staff", "lead", "senior", "sr"] },
+        { "weight": 10, "patterns": ["fintech", "platform", "developer", "subscriptions", "marketplace", "saas", "b2b"] }
+      ],
+      "compensation_boost": {
+        "weight": 10,
+        "min_salary": 200000
+      }
+    },
+    "deduplication_policy": {
+      "reapplication_cooldown_days": 90,
+      "interview_company_exclusion_days": 365,
+      "interview_stage_keywords": ["interview", "hm round", "panel", "screen", "working session"]
+    }
+  },
+
+  "_example_preset_software_engineering": {
+    "role_category_label": "Senior / Staff Software Engineering",
+    "include_role_patterns": [
+      "\\b(staff|principal|senior|sr\\.?|lead)?\\s*(software|backend|frontend|fullstack|ml|ai|systems)\\s*(engineer|developer)\\b"
+    ],
+    "exclude_role_keywords": ["qa engineer", "support engineer", "sales engineer", "recruiter"],
+    "exclude_management_keywords": ["engineering manager", "director of engineering", "vp of engineering"],
+    "fit_scoring": {
+      "base_score": 50,
+      "fit_score_threshold_percent": 75,
+      "keyword_boosts": [
+        { "weight": 25, "patterns": ["distributed systems", "llm infrastructure", "cuda", "triton", "gpu"] },
+        { "weight": 18, "patterns": ["python", "rust", "c++", "go", "pytorch"] },
+        { "weight": 15, "patterns": ["staff", "principal", "lead"] }
+      ]
+    }
+  }
+}

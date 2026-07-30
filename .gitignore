@@ -15,6 +15,7 @@ __pycache__/
 
 # Personal Files & User Data Folders
 personal-files/*
+!personal-files/config.example.json
 !personal-files/sources.example.json
 !personal-files/.gitkeep
 
@@ -24,6 +25,7 @@ logs/
 job-leads.md
 Pipeline.md
 Profile.md
+config.json
 sources.json
 step1.md
 step2.md

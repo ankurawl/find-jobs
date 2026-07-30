@@ -1,13 +1,14 @@
 # Job Discovery Engine (`find-jobs`)
 
-A modular, ground-truth Individual Contributor (IC) US-eligible Job Discovery Engine and Startup Lead Finder.
+A modular, profession-agnostic, ground-truth Job Discovery Engine and Startup Lead Finder.
 
 ## Features
+- **Profession & Level Agnostic**: Search criteria, title regexes, location keywords, compensation thresholds, and fit score weightings are fully configurable via `config.json`.
 - **Multi-Strategy Career Discovery**: Scrapes ATS job boards (Ashby, Greenhouse, Lever APIs) and direct company website career pages.
 - **Funding News Entity Extractor**: Scrapes funding news sources (TechCrunch, VentureBeat, Crunchbase News, PR Newswire) to extract freshly funded startup entities.
-- **Filtering & Fit Scoring**: Evaluates roles against IC PM target criteria ($200K+ base salary, US-eligible location, 75%+ candidate fit threshold). Excludes People Management roles (Director, VP, Head of Product, GPM).
+- **Filtering & Fit Scoring**: Evaluates roles against your customized role patterns and keyword scoring weights.
 - **Date-Aware Deduplication**: Excludes active pipeline roles, 90-day re-applications, and 12-month interview exclusions.
-- **Configurable Data Separation**: Personal candidate profile (`Profile.md`), tracking pipeline (`Pipeline.md`), and search target lists (`sources.json`) remain in a separate folder defined in `.env`.
+- **Configurable Data Separation**: Personal candidate profile (`Profile.md`), tracking pipeline (`Pipeline.md`), and search target lists (`config.json`) remain in a separate folder defined in `.env`.
 
 ---
 
@@ -31,7 +32,7 @@ Edit `.env` to specify your personal data folder:
 JOB_DATA_DIR=personal-files
 ```
 
-If `JOB_DATA_DIR` is set to `personal-files`, place your `Profile.md`, `Pipeline.md`, and `sources.json` inside `personal-files/`. You can use `personal-files/sources.example.json` as a starting template.
+If `JOB_DATA_DIR` is set to `personal-files`, place your `Profile.md`, `Pipeline.md`, and `config.json` inside `personal-files/`. You can use `personal-files/config.example.json` as a starting template.
 
 ---
 
@@ -46,7 +47,7 @@ Simply ask your AI assistant (AGY, Claude Code, etc.):
 .venv/bin/python find_jobs.py
 ```
 
-### Debug Mode
+### Debug & Inspection Mode
 ```bash
 .venv/bin/python debug_job_finder.py
 ```
@@ -64,7 +65,7 @@ find-jobs/
 ├── find_jobs.py               # Main job discovery script
 ├── debug_job_finder.py        # Debug script for raw feed/ATS inspection
 ├── personal-files/
-│   └── sources.example.json   # Sanitized reference config template
+│   └── config.example.json    # Sanitized reference config template
 └── .agents/
     └── skills/
         └── find-jobs/
@@ -74,4 +75,4 @@ find-jobs/
 ---
 
 ## Data Privacy & Security
-Personal data files (`Profile.md`, `Pipeline.md`, `sources.json`, `job-leads.md`), local environment config (`.env`), virtual environment (`.venv/`), and execution logs (`logs/`) are strictly listed in `.gitignore` to prevent any accidental leakage.
+Personal data files (`Profile.md`, `Pipeline.md`, `config.json`, `job-leads.md`), local environment config (`.env`), virtual environment (`.venv/`), and execution logs (`logs/`) are strictly listed in `.gitignore` to prevent any accidental leakage.

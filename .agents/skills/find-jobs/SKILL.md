@@ -8,13 +8,13 @@ description: >-
 
 This skill defines the instructions and automated workflow for discovering high-growth startup leads and senior product management opportunities, scoring candidate fit, deduplicating, and updating `job-leads.md`.
 
-## Data Configuration (.env)
+## Data Configuration (.env & config.json)
 - The execution engine resolves the target data directory dynamically from `.env` (`JOB_DATA_DIR`).
-- Target data directory contains `Profile.md`, `Pipeline.md`, `sources.json`, and `job-leads.md`.
+- Target data directory contains `Profile.md`, `Pipeline.md`, `config.json`, and `job-leads.md`.
 
 ## Core Rules & Criteria
 1. **Virtual Environment**: ALWAYS use the Python virtual environment located at `/home/agag/Documents/find-jobs/.venv/bin/python` for executing `/home/agag/Documents/find-jobs/find_jobs.py`.
-2. **Sources & Config**: Reads job sources, funding feeds, and filtering rules from `sources.json` in the configured `JOB_DATA_DIR` (falls back to `personal-files/sources.example.json`).
+2. **Sources & Config**: Reads job sources, funding feeds, role title patterns, and filtering rules from `config.json` in the configured `JOB_DATA_DIR` (falls back to `personal-files/config.example.json`).
 3. **Filtering Rules**:
    - **Funding / Valuation**: Private companies must have raised Series B, C, D+ in the last 6 months, or have a valuation/market cap ≥ $100M USD.
    - **US Market & Location**: US-focused opportunities (On-site, Remote, or Hybrid). Candidate is based in Austin but open to relocation/travel.

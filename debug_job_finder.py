@@ -30,11 +30,16 @@ else:
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
-if not os.path.exists(SOURCES_FILE):
-    example_sources = os.path.join(REPO_DIR, "personal-files", "sources.example.json")
-    if os.path.exists(example_sources):
-        SOURCES_FILE = example_sources
+# Resolve Config File (prefer config.json, fallback to sources.json or config.example.json)
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+if not os.path.exists(CONFIG_FILE):
+    legacy_sources = os.path.join(DATA_DIR, "sources.json")
+    if os.path.exists(legacy_sources):
+        CONFIG_FILE = legacy_sources
+    else:
+        example_cfg = os.path.join(REPO_DIR, "personal-files", "config.example.json")
+        if os.path.exists(example_cfg):
+            CONFIG_FILE = example_cfg
 
 PROFILE_FILE = os.path.join(DATA_DIR, "Profile.md")
 PIPELINE_FILE = os.path.join(DATA_DIR, "Pipeline.md")
@@ -44,7 +49,7 @@ STEP1_FILE = os.path.join(DATA_DIR, "step1.md")
 STEP2_FILE = os.path.join(DATA_DIR, "step2.md")
 STEP3_FILE = os.path.join(DATA_DIR, "step3.md")
 
-# 16 Target Startup Companies with corrected ATS slugs and endpoints
+# Target Startup Companies with ATS slugs
 TARGET_COMPANIES = [
     {"name": "Decagon", "slug": "decagon", "ats": "Ashby", "url": "https://api.ashbyhq.com/posting-api/job-board/decagon"},
     {"name": "Scale AI", "slug": "scaleai", "ats": "Greenhouse", "url": "https://boards-api.greenhouse.io/v1/boards/scaleai/jobs"},
@@ -144,8 +149,6 @@ def fetch_web_source(source_info):
         r = curl_requests.get(url, impersonate="chrome", timeout=10)
         if r.status_code in (200, 301, 302):
             soup = BeautifulSoup(r.text, "html.parser")
-            
-            # Scrape links that look like job postings or articles
             links = soup.find_all("a", href=True)
             seen_titles = set()
             for link in links:
@@ -154,7 +157,6 @@ def fetch_web_source(source_info):
                 if not href.startswith("http"):
                     href = requests.compat.urljoin(url, href)
                 
-                # Filter out generic short nav links
                 if len(t_text) >= 8 and t_text.lower() not in ("home", "about", "careers", "privacy", "terms", "jobs", "login", "sign up", "learn more"):
                     if t_text not in seen_titles:
                         seen_titles.add(t_text)
@@ -172,104 +174,73 @@ def fetch_web_source(source_info):
 
     return jobs
 
-# --- Filtering Functions for Step 2 ---
+# --- Dynamic Filtering Functions for Step 2 ---
 
-def is_ic_pm_role(title):
+def is_matching_role(title, filter_criteria):
     t = title.lower()
-    
-    # Rejections for People Management / Executive roles
-    people_mgmt_rejections = [
-        'director', 'vp of', 'vp,', 'head of', 'group product manager', 'gpm',
-        'people manager', 'manager, sales', 'manager, engineering', 'engineering manager',
-        'talent development manager', 'sales manager', 'manager of product'
-    ]
-    if any(rej in t for rej in people_mgmt_rejections):
+
+    exclude_mgmt = filter_criteria.get("exclude_management_keywords", [])
+    if any(rej in t for rej in exclude_mgmt if rej):
         return False
-        
-    # IC PM Positive Patterns
-    pm_patterns = [
-        r'\b(principal|staff|senior|sr\.?|lead)?\s*(product\s*manager|product\s*lead|pm)\b',
-        r'\bresearch\s+product\s+manager\b',
-        r'\bdeployed\s+product\s+manager\b',
-        r'\bai\s+product\s+manager\b'
-    ]
-    
-    matches_pm = any(re.search(pat, t) for pat in pm_patterns)
-    if not matches_pm:
+
+    exclude_roles = filter_criteria.get("exclude_role_keywords", [])
+    if any(rej in t for rej in exclude_roles if rej):
         return False
-        
-    # Rejections for non-PM roles
-    non_pm_rejections = [
-        'sales development', 'business development', 'development representative', 
-        'account executive', 'product marketing', 'product designer', 'product security',
-        'program manager', 'project manager', 'development manager', 'enablement manager',
-        'software engineer', 'sales engineer', 'recruiter', 'analyst', 'legal', 'finance'
-    ]
-    if any(rej in t for rej in non_pm_rejections):
-        return False
+
+    include_patterns = filter_criteria.get("include_role_patterns", [])
+    if include_patterns:
+        matches_pattern = any(re.search(pat, t, re.IGNORECASE) for pat in include_patterns)
+        if not matches_pattern:
+            return False
 
     return True
 
-def is_us_eligible_location(loc_str, title_str=""):
+def is_eligible_location(loc_str, title_str, filter_criteria):
     title_lower = str(title_str).lower()
     loc_lower = str(loc_str).lower()
-    
-    explicit_title_non_us = ['sydney', 'australia', 'german speaking', 'emea only', 'apac only', 'london only', 'japan only']
-    if any(term in title_lower for term in explicit_title_non_us):
+
+    excluded_locs = filter_criteria.get("excluded_location_keywords", [])
+    allowed_locs = filter_criteria.get("allowed_location_keywords", [])
+
+    if any(term in title_lower for term in excluded_locs if len(term) > 3):
         return False
-        
-    us_indicators = [
-        r'\bus\b', r'\bunited states\b', r'\bamerica\b', r'\bamericas\b', r'\bnorth america\b',
-        r'\bca\b', r'\bny\b', r'\bwa\b', r'\btx\b', r'\bma\b', r'\bco\b', r'\bdc\b', r'\bil\b', r'\bva\b', r'\bga\b', r'\bfl\b',
-        r'san francisco', r'new york', r'austin', r'seattle', r'boston', r'chicago', r'los angeles', r'denver', r'washington',
-        r'remote - us', r'us \(remote', r'remote \(us\)', r'us /', r'/ us', r'united states'
-    ]
+
+    has_allowed = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in allowed_locs if term)
     
-    non_us_indicators = [
-        'london', 'uk', 'united kingdom', 'germany', 'berlin', 'munich', 
-        'france', 'paris', 'sydney', 'australia', 'melbourne', 'canada', 'toronto', 
-        'vancouver', 'singapore', 'japan', 'tokyo', 'india', 'bangalore', 'mumbai', 
-        'saudi arabia', 'riyadh', 'dubai', 'uae', 'qatar', 'doha', 'emea', 'apac', 
-        'latam', 'europe', 'asia', 'south korea', 'seoul', 'brazil', 'mexico', 
-        'amsterdam', 'netherlands', 'switzerland', 'zurich', 'stockholm', 'sweden', 
-        'dublin', 'ireland', 'mena'
-    ]
-    
-    has_us_indicator = any(re.search(pat, loc_lower) for pat in us_indicators)
-    
-    if loc_str == 'US (Remote / On-site)' or has_us_indicator or loc_str == 'US / Unspecified':
+    if loc_str in ('US (Remote / On-site)', 'US / Unspecified') or has_allowed:
         return True
-        
-    has_non_us = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in non_us_indicators)
-    if has_non_us and not has_us_indicator:
+
+    has_excluded = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in excluded_locs if term)
+    if has_excluded and not has_allowed:
         return False
 
     return True
 
-def calculate_fit_score(title, domain_text, comp_text, company_name):
-    score = 50
+def calculate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+    fit_cfg = filter_criteria.get("fit_scoring", {})
+    base_score = fit_cfg.get("base_score", 50)
+    score = base_score
     combined = (title + " " + domain_text).lower()
-    
-    if any(ex in company_name.lower() for ex in ["meta", "facebook", "amazon"]):
+
+    excluded_comps = filter_criteria.get("excluded_company_names", [])
+    if any(ex.lower() in company_name.lower() for ex in excluded_comps if ex):
         return 0
-        
-    if re.search(r'\b(agentic|agent|agents|ai agent|ai agents|evals|evaluation|eval)\b', combined):
-        score += 25
-    elif re.search(r'\b(ai|llm|machine learning|genai|generative ai)\b', combined):
-        score += 18
-        
-    if re.search(r'\b(principal|staff|lead|senior|sr)\b', combined):
-        score += 15
 
-    if re.search(r'\b(fintech|platform|developer|subscriptions|marketplace|saas|b2b)\b', combined):
-        score += 10
+    keyword_boosts = fit_cfg.get("keyword_boosts", [])
+    for boost in keyword_boosts:
+        weight = boost.get("weight", 10)
+        patterns = boost.get("patterns", [])
+        if any(re.search(r'\b' + re.escape(p.lower()) + r'\b', combined) for p in patterns):
+            score += weight
 
-    if "$200k" in comp_text.lower() or "$2" in comp_text or "200,000" in comp_text or "300" in comp_text:
-        score += 10
+    comp_boost_cfg = fit_cfg.get("compensation_boost", {})
+    min_sal = comp_boost_cfg.get("min_salary", 200000)
+    weight = comp_boost_cfg.get("weight", 10)
+
+    if str(min_sal) in comp_text or "$200k" in comp_text.lower() or "$2" in comp_text:
+        score += weight
 
     return min(100, max(0, score))
-
-# --- Pipeline Exclusions for Step 3 ---
 
 def extract_job_id_from_url(url):
     if not url:
@@ -310,7 +281,7 @@ def parse_date(date_str):
             pass
     return None
 
-def parse_exclusions_from_pipeline(file_path):
+def parse_exclusions_from_pipeline(file_path, filter_criteria):
     excluded_urls = set()
     excluded_job_ids = set()
     excluded_company_roles = set()
@@ -318,6 +289,11 @@ def parse_exclusions_from_pipeline(file_path):
 
     if not os.path.exists(file_path):
         return excluded_urls, excluded_job_ids, excluded_company_roles, excluded_companies_12m
+
+    dedup_cfg = filter_criteria.get("deduplication_policy", {})
+    reapp_cooldown = dedup_cfg.get("reapplication_cooldown_days", 90)
+    interview_cooldown = dedup_cfg.get("interview_company_exclusion_days", 365)
+    interview_kws = dedup_cfg.get("interview_stage_keywords", ['interview', 'hm round', 'panel', 'screen', 'working session'])
 
     content = read_file(file_path)
     current_section = ""
@@ -362,7 +338,7 @@ def parse_exclusions_from_pipeline(file_path):
                             excluded_job_ids.add(jid)
 
                 elif "Applied, No Update" in current_section:
-                    if days_ago < 90:
+                    if days_ago < reapp_cooldown:
                         if comp_norm and role_norm:
                             excluded_company_roles.add((comp_norm, role_norm))
                         for u in urls:
@@ -372,8 +348,8 @@ def parse_exclusions_from_pipeline(file_path):
                                 excluded_job_ids.add(jid)
 
                 elif "Rejected" in current_section or "Self Selected Out" in current_section:
-                    interviewed = any(kw in status_text.lower() for kw in ['interview', 'hm round', 'panel', 'screen', 'working session'])
-                    cutoff_days = 365 if interviewed else 90
+                    interviewed = any(kw in status_text.lower() for kw in interview_kws)
+                    cutoff_days = interview_cooldown if interviewed else reapp_cooldown
 
                     if days_ago < cutoff_days:
                         if interviewed and comp_norm:
@@ -416,131 +392,78 @@ def is_already_considered(job, excluded_urls, excluded_job_ids, excluded_company
 
     return False, ""
 
-# --- Main Debug Execution ---
-
 def main():
-    print("=== STARTING JOB FINDER DEBUG WORKFLOW ===")
-    print(f"Data Directory Target: {DATA_DIR}")
-    config = load_json(SOURCES_FILE)
-    job_sources = config.get("job_sources", [])
-    news_sources = config.get("funding_news_sources", [])
+    print(f"Executing debug workflow using config: {CONFIG_FILE}")
+    config = load_json(CONFIG_FILE)
+    filter_criteria = config.get("filter_criteria", {})
+    threshold = filter_criteria.get("fit_scoring", {}).get("fit_score_threshold_percent", 75)
 
-    all_raw_jobs = []
-    source_counts = {}
-    company_names = set()
+    # STEP 1: Collect ALL raw listings
+    print("Step 1: Collecting raw job postings from target companies & news feeds...")
+    raw_jobs = []
 
-    # Step 1: Collect ALL raw jobs from ALL sources
-    print("\n--- STEP 1: Collecting Raw Listings ---")
-    
-    # A. 16 Target Company ATS Boards
     for comp in TARGET_COMPANIES:
-        c_name = comp["name"]
-        company_names.add(c_name)
         jobs = fetch_ats_jobs(comp)
-        src_label = f"{c_name} ({comp['ats']} API)"
-        source_counts[src_label] = len(jobs)
-        all_raw_jobs.extend(jobs)
-        print(f"Collected {len(jobs)} raw jobs from {c_name} via {comp['ats']}")
+        raw_jobs.extend(jobs)
 
-    # B. Web / Curated Sources
-    for src in job_sources + news_sources:
-        s_name = src["name"]
-        jobs = fetch_web_source(src)
-        source_counts[s_name] = len(jobs)
-        all_raw_jobs.extend(jobs)
-        print(f"Collected {len(jobs)} raw listings from {s_name}")
+    for src in config.get("job_sources", []):
+        if src.get("type") in ("job_board", "curated_jobs", "curated_pm_jobs", "tech_news"):
+            jobs = fetch_web_source(src)
+            raw_jobs.extend(jobs)
 
-    # Write Step 1 Output
-    step1_md = f"# Step 1: Raw Collected Job Listings (No Filtering, No Deduplication)\n\n"
-    step1_md += f"**Total Raw Listings Discovered**: {len(all_raw_jobs)}\n"
-    step1_md += f"**Total Sources Checked**: {len(source_counts)}\n\n"
-    step1_md += "## Source Summary\n"
-    step1_md += "| Source | Raw Count |\n| :--- | :--- |\n"
-    for src, count in source_counts.items():
-        step1_md += f"| {src} | {count} |\n"
-    step1_md += "\n## Raw Listings Details\n\n"
-    step1_md += "| # | Company | Title | Location | Source | URL |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n"
-    for idx, j in enumerate(all_raw_jobs, 1):
-        step1_md += f"| {idx} | **{j['company']}** | {j['title']} | {j['location']} | {j['source']} | [{j['url']}]({j['url']}) |\n"
-
+    step1_lines = ["# Step 1: Raw Unfiltered Job Listings\n\n| Company | Title | Location | Source | URL |\n| :--- | :--- | :--- | :--- | :--- |\n"]
+    for j in raw_jobs:
+        step1_lines.append(f"| **{j['company']}** | {j['title']} | {j['location']} | {j['source']} | [Link]({j['url']}) |")
+    
     with open(STEP1_FILE, "w", encoding="utf-8") as f:
-        f.write(step1_md)
-    print(f"Saved Step 1 output to {STEP1_FILE}")
+        f.write("\n".join(step1_lines) + "\n")
+    print(f"Step 1 completed: {len(raw_jobs)} raw jobs written to step1.md")
 
-    # Step 2: Apply Filtering Logic
-    print("\n--- STEP 2: Applying Filtering Logic ---")
-    filtered_jobs = []
-    threshold = config.get("filter_criteria", {}).get("fit_score_threshold_percent", 75)
+    # STEP 2: Filtered listings (Role + Location + Fit Score)
+    print("Step 2: Applying role matching, location eligibility, and fit score evaluation...")
+    step2_jobs = []
+    step2_lines = ["# Step 2: Filtered Job Listings\n\n| Company | Title | Location | Fit Score | Status | Source | URL |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"]
 
-    for j in all_raw_jobs:
-        title = j["title"]
-        loc = j["location"]
-        comp = j["company"]
-        
-        # Rule 1: IC PM Title
-        if not is_ic_pm_role(title):
-            continue
-            
-        # Rule 2: US Location
-        if not is_us_eligible_location(loc, title):
-            continue
-            
-        # Rule 3: Fit Score Threshold
-        fit_score = calculate_fit_score(title, j.get("domain", ""), j.get("comp", ""), comp)
-        if fit_score < threshold:
-            continue
+    for j in raw_jobs:
+        role_pass = is_matching_role(j["title"], filter_criteria)
+        loc_pass = is_eligible_location(j["location"], j["title"], filter_criteria)
 
-        j["fit_score"] = fit_score
-        filtered_jobs.append(j)
+        if not role_pass:
+            status = "Rejected (Role Mismatch)"
+        elif not loc_pass:
+            status = "Rejected (Location Non-US)"
+        else:
+            score = calculate_fit_score(j["title"], j["domain"], j["comp"], j["company"], filter_criteria)
+            if score >= threshold:
+                status = f"PASSED ({score}%)"
+                step2_jobs.append(j)
+            else:
+                status = f"Rejected (Low Fit Score: {score}%)"
 
-    step2_md = f"# Step 2: Filtered Job Listings (IC PM Rules, US Location, Fit Score ≥ {threshold}%)\n\n"
-    step2_md += f"**Remaining Jobs After Filtering**: {len(filtered_jobs)}\n\n"
-    step2_md += "| # | Company | Title | Location | Fit Score | Source | URL |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
-    for idx, j in enumerate(filtered_jobs, 1):
-        step2_md += f"| {idx} | **{j['company']}** | {j['title']} | {j['location']} | **{j['fit_score']}%** | {j['source']} | [{j['url']}]({j['url']}) |\n"
+        step2_lines.append(f"| **{j['company']}** | {j['title']} | {j['location']} | {status} | {j['source']} | [Link]({j['url']}) |")
 
     with open(STEP2_FILE, "w", encoding="utf-8") as f:
-        f.write(step2_md)
-    print(f"Saved Step 2 output to {STEP2_FILE} ({len(filtered_jobs)} remaining)")
+        f.write("\n".join(step2_lines) + "\n")
+    print(f"Step 2 completed: {len(step2_jobs)} filtered jobs written to step2.md")
 
-    # Step 3: Deduplicate Against Pipeline.md
-    print("\n--- STEP 3: Deduplicating Against Pipeline.md ---")
-    p_urls, p_jids, p_croles, p_c12m = parse_exclusions_from_pipeline(PIPELINE_FILE)
-    
-    deduped_jobs = []
-    excluded_reasons = []
+    # STEP 3: Deduplicated against Pipeline.md
+    print("Step 3: Deduplicating filtered jobs against Pipeline.md...")
+    p_urls, p_jids, p_croles, p_c12m = parse_exclusions_from_pipeline(PIPELINE_FILE, filter_criteria)
 
-    for j in filtered_jobs:
+    step3_lines = ["# Step 3: Pipeline Comparison & Final Deduplication\n\n| Company | Title | Location | Status | Exclusion Reason | URL |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n"]
+    final_count = 0
+
+    for j in step2_jobs:
         already_considered, reason = is_already_considered(j, p_urls, p_jids, p_croles, p_c12m)
         if already_considered:
-            excluded_reasons.append((j, reason))
+            step3_lines.append(f"| **{j['company']}** | {j['title']} | {j['location']} | EXCLUDED | {reason} | [Link]({j['url']}) |")
         else:
-            deduped_jobs.append(j)
-
-    step3_md = f"# Step 3: Final Deduplicated Job Opportunities (Compared against Pipeline.md)\n\n"
-    step3_md += f"**Final Opportunities Available**: {len(deduped_jobs)}\n"
-    step3_md += f"**Excluded Past Roles / Active Applications**: {len(excluded_reasons)}\n\n"
-    step3_md += "## Final Qualifying Opportunities\n\n"
-    step3_md += "| # | Company | Role | Location | Fit Score | Source | URL |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
-    for idx, j in enumerate(deduped_jobs, 1):
-        step3_md += f"| {idx} | **{j['company']}** | {j['title']} | {j['location']} | **{j['fit_score']}%** | {j['source']} | [{j['url']}]({j['url']}) |\n"
-
-    step3_md += "\n## Excluded Roles (Matched Pipeline.md)\n\n"
-    step3_md += "| Company | Role | Exclusion Reason |\n| :--- | :--- | :--- |\n"
-    for j, reason in excluded_reasons:
-        step3_md += f"| **{j['company']}** | {j['title']} | {reason} |\n"
+            final_count += 1
+            step3_lines.append(f"| **{j['company']}** | {j['title']} | {j['location']} | NEW LEAD | N/A | [Link]({j['url']}) |")
 
     with open(STEP3_FILE, "w", encoding="utf-8") as f:
-        f.write(step3_md)
-    print(f"Saved Step 3 output to {STEP3_FILE} ({len(deduped_jobs)} remaining)")
-
-    # Print summary statistics
-    print("\n=== SUMMARY METRICS FOR REPORT ===")
-    print(f"Total Sources Checked: {len(source_counts)}")
-    print(f"Target Companies Checked ({len(TARGET_COMPANIES)}): {', '.join([c['name'] for c in TARGET_COMPANIES])}")
-    print(f"Total Raw Jobs Found: {len(all_raw_jobs)}")
-    print(f"Jobs After Filtering (Step 2): {len(filtered_jobs)}")
-    print(f"Jobs After Deduplication (Step 3): {len(deduped_jobs)}")
+        f.write("\n".join(step3_lines) + "\n")
+    print(f"Step 3 completed: {final_count} new leads written to step3.md")
 
 if __name__ == "__main__":
     main()

@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 find_jobs.py
-Comprehensive Ground-Truth Individual Contributor (IC) US-Eligible Job Discovery Engine.
+Comprehensive Ground-Truth Job Discovery Engine.
 
 Features:
-1. Dynamic Target Companies Config sync with Pipeline.md (Command Center).
-2. Funding News Entity Extractor: Scrapes news sources (TechCrunch, Crunchbase News, VentureBeat, etc.), 
+1. Profession & Level Agnostic: Fully configured via config.json (JOB_DATA_DIR).
+2. Dynamic Target Companies Config sync with Pipeline.md (Command Center).
+3. Funding News Entity Extractor: Scrapes news sources (TechCrunch, Crunchbase News, VentureBeat, etc.), 
    extracts funded startup names, and appends them to Pipeline.md under Target Companies Config.
-3. Multi-Strategy Career Discovery:
+4. Multi-Strategy Career Discovery:
    - Strategy A: Direct ATS APIs (Ashby, Greenhouse, Lever, etc.)
-   - Strategy B: Direct Website Career Page Scraping (Visiting company /careers pages directly).
-4. Error & Success Logging: Records all success/error statuses (Cloudflare 403, 404, Login Required, etc.) 
-   and appends a clean 'Scraping & Discovery Logs' section to job-leads.md.
+   - Strategy B: Direct Website Career Page Scraping.
+5. Configurable Fit Scoring & Deduplication Engine.
+6. Error & Success Logging: Appends a clean 'Scraping & Discovery Logs' section to job-leads.md.
 """
 
 import json
@@ -40,11 +41,16 @@ else:
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
-if not os.path.exists(SOURCES_FILE):
-    example_sources = os.path.join(REPO_DIR, "personal-files", "sources.example.json")
-    if os.path.exists(example_sources):
-        SOURCES_FILE = example_sources
+# Resolve Config File (prefer config.json, fallback to sources.json or config.example.json)
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+if not os.path.exists(CONFIG_FILE):
+    legacy_sources = os.path.join(DATA_DIR, "sources.json")
+    if os.path.exists(legacy_sources):
+        CONFIG_FILE = legacy_sources
+    else:
+        example_cfg = os.path.join(REPO_DIR, "personal-files", "config.example.json")
+        if os.path.exists(example_cfg):
+            CONFIG_FILE = example_cfg
 
 PROFILE_FILE = os.path.join(DATA_DIR, "Profile.md")
 PIPELINE_FILE = os.path.join(DATA_DIR, "Pipeline.md")
@@ -130,7 +136,6 @@ def parse_target_companies_from_pipeline():
                 if "Company" in comp_raw or "---" in comp_raw:
                     continue
 
-                # Parse ATS platform and slug if present e.g. Ashby (`decagon`)
                 ats_type = "Auto"
                 slug = comp_raw.lower().replace(" ", "")
                 if "Ashby" in ats_info:
@@ -206,7 +211,6 @@ def extract_funding_news_and_update_targets(news_sources):
                         if m:
                             comp = m.group(1).strip()
                             fund = m.group(2).strip()
-                            # Clean noise
                             comp_clean = re.sub(r'^(?:As|The|AI|New|Startup|Tech|How|Why|What|After|With)\s+', '', comp, flags=re.IGNORECASE).strip()
                             if len(comp_clean) >= 3 and not any(w in comp_clean.lower() for w in ['series', 'million', 'billion', 'funding', 'round', 'investor', 'capital']):
                                 website = f"https://{comp_clean.lower().replace(' ', '')}.com"
@@ -320,7 +324,7 @@ def fetch_jobs_from_ats_api(company):
 
     return found_jobs
 
-def scrape_jobs_directly_from_company_website(company):
+def scrape_jobs_directly_from_company_website(company, direct_keywords):
     c_name = company["name"]
     website = company.get("website", "")
     found_jobs = []
@@ -335,6 +339,8 @@ def scrape_jobs_directly_from_company_website(company):
         website.rstrip("/") + "/join-us"
     ]
 
+    kw_list = [kw.lower() for kw in direct_keywords] if direct_keywords else ['product manager', 'engineer', 'developer', 'manager', 'lead']
+
     for c_url in candidate_career_urls:
         try:
             r = curl_requests.get(c_url, impersonate="chrome", timeout=8)
@@ -348,7 +354,7 @@ def scrape_jobs_directly_from_company_website(company):
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(c_url, href)
                     
-                    if any(kw in t_text.lower() for kw in ['product manager', 'product lead', 'staff pm', 'principal pm', 'senior pm']):
+                    if any(kw in t_text.lower() for kw in kw_list):
                         found_jobs.append({
                             "company": c_name,
                             "title": t_text,
@@ -371,95 +377,69 @@ def scrape_jobs_directly_from_company_website(company):
 
 # --- Filtering & Deduplication ---
 
-def is_ic_pm_role(title):
+def is_matching_role(title, filter_criteria):
     t = title.lower()
-    
-    people_mgmt_rejections = [
-        'director', 'vp of', 'vp,', 'head of', 'group product manager', 'gpm',
-        'people manager', 'manager, sales', 'manager, engineering', 'engineering manager',
-        'talent development manager', 'sales manager', 'manager of product'
-    ]
-    if any(rej in t for rej in people_mgmt_rejections):
+
+    exclude_mgmt = filter_criteria.get("exclude_management_keywords", [])
+    if any(rej in t for rej in exclude_mgmt if rej):
         return False
-        
-    pm_patterns = [
-        r'\b(principal|staff|senior|sr\.?|lead)?\s*(product\s*manager|product\s*lead|pm)\b',
-        r'\bresearch\s+product\s+manager\b',
-        r'\bdeployed\s+product\s+manager\b',
-        r'\bai\s+product\s+manager\b'
-    ]
-    
-    matches_pm = any(re.search(pat, t) for pat in pm_patterns)
-    if not matches_pm:
+
+    exclude_roles = filter_criteria.get("exclude_role_keywords", [])
+    if any(rej in t for rej in exclude_roles if rej):
         return False
-        
-    non_pm_rejections = [
-        'sales development', 'business development', 'development representative', 
-        'account executive', 'product marketing', 'product designer', 'product security',
-        'program manager', 'project manager', 'development manager', 'enablement manager',
-        'software engineer', 'sales engineer', 'recruiter', 'analyst', 'legal', 'finance'
-    ]
-    if any(rej in t for rej in non_pm_rejections):
-        return False
+
+    include_patterns = filter_criteria.get("include_role_patterns", [])
+    if include_patterns:
+        matches_pattern = any(re.search(pat, t, re.IGNORECASE) for pat in include_patterns)
+        if not matches_pattern:
+            return False
 
     return True
 
-def is_us_eligible_location(loc_str, title_str=""):
+def is_eligible_location(loc_str, title_str, filter_criteria):
     title_lower = str(title_str).lower()
     loc_lower = str(loc_str).lower()
-    
-    explicit_title_non_us = ['sydney', 'australia', 'german speaking', 'emea only', 'apac only', 'london only', 'japan only']
-    if any(term in title_lower for term in explicit_title_non_us):
+
+    excluded_locs = filter_criteria.get("excluded_location_keywords", [])
+    allowed_locs = filter_criteria.get("allowed_location_keywords", [])
+
+    if any(term in title_lower for term in excluded_locs if len(term) > 3):
         return False
-        
-    us_indicators = [
-        r'\bus\b', r'\bunited states\b', r'\bamerica\b', r'\bamericas\b', r'\bnorth america\b',
-        r'\bca\b', r'\bny\b', r'\bwa\b', r'\btx\b', r'\bma\b', r'\bco\b', r'\bdc\b', r'\bil\b', r'\bva\b', r'\bga\b', r'\bfl\b',
-        r'san francisco', r'new york', r'austin', r'seattle', r'boston', r'chicago', r'los angeles', r'denver', r'washington',
-        r'remote - us', r'us \(remote', r'remote \(us\)', r'us /', r'/ us', r'united states'
-    ]
+
+    has_allowed = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in allowed_locs if term)
     
-    non_us_indicators = [
-        'london', 'uk', 'united kingdom', 'germany', 'berlin', 'munich', 
-        'france', 'paris', 'sydney', 'australia', 'melbourne', 'canada', 'toronto', 
-        'vancouver', 'singapore', 'japan', 'tokyo', 'india', 'bangalore', 'mumbai', 
-        'saudi arabia', 'riyadh', 'dubai', 'uae', 'qatar', 'doha', 'emea', 'apac', 
-        'latam', 'europe', 'asia', 'south korea', 'seoul', 'brazil', 'mexico', 
-        'amsterdam', 'netherlands', 'switzerland', 'zurich', 'stockholm', 'sweden', 
-        'dublin', 'ireland', 'mena'
-    ]
-    
-    has_us_indicator = any(re.search(pat, loc_lower) for pat in us_indicators)
-    
-    if loc_str == 'US (Remote / On-site)' or has_us_indicator or loc_str == 'US / Unspecified':
+    if loc_str in ('US (Remote / On-site)', 'US / Unspecified') or has_allowed:
         return True
-        
-    has_non_us = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in non_us_indicators)
-    if has_non_us and not has_us_indicator:
+
+    has_excluded = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in excluded_locs if term)
+    if has_excluded and not has_allowed:
         return False
 
     return True
 
-def calculate_fit_score(title, domain_text, comp_text, company_name):
-    score = 50
+def calculate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+    fit_cfg = filter_criteria.get("fit_scoring", {})
+    base_score = fit_cfg.get("base_score", 50)
+    score = base_score
     combined = (title + " " + domain_text).lower()
-    
-    if any(ex in company_name.lower() for ex in ["meta", "facebook", "amazon"]):
+
+    excluded_comps = filter_criteria.get("excluded_company_names", [])
+    if any(ex.lower() in company_name.lower() for ex in excluded_comps if ex):
         return 0
-        
-    if re.search(r'\b(agentic|agent|agents|ai agent|ai agents|evals|evaluation|eval)\b', combined):
-        score += 25
-    elif re.search(r'\b(ai|llm|machine learning|genai|generative ai)\b', combined):
-        score += 18
-        
-    if re.search(r'\b(principal|staff|lead|senior|sr)\b', combined):
-        score += 15
 
-    if re.search(r'\b(fintech|platform|developer|subscriptions|marketplace|saas|b2b)\b', combined):
-        score += 10
+    keyword_boosts = fit_cfg.get("keyword_boosts", [])
+    for boost in keyword_boosts:
+        weight = boost.get("weight", 10)
+        patterns = boost.get("patterns", [])
+        if any(re.search(r'\b' + re.escape(p.lower()) + r'\b', combined) for p in patterns):
+            score += weight
 
-    if "$200k" in comp_text.lower() or "$2" in comp_text or "200,000" in comp_text or "300" in comp_text:
-        score += 10
+    comp_boost_cfg = fit_cfg.get("compensation_boost", {})
+    min_sal = comp_boost_cfg.get("min_salary", 200000)
+    weight = comp_boost_cfg.get("weight", 10)
+
+    if str(min_sal) in comp_text or "$200k" in comp_text.lower() or "$2" in comp_text:
+        score += weight
 
     return min(100, max(0, score))
 
@@ -502,7 +482,7 @@ def parse_date(date_str):
             pass
     return None
 
-def parse_exclusions_from_pipeline(file_path):
+def parse_exclusions_from_pipeline(file_path, filter_criteria):
     excluded_urls = set()
     excluded_job_ids = set()
     excluded_company_roles = set()
@@ -510,6 +490,11 @@ def parse_exclusions_from_pipeline(file_path):
 
     if not os.path.exists(file_path):
         return excluded_urls, excluded_job_ids, excluded_company_roles, excluded_companies_12m
+
+    dedup_cfg = filter_criteria.get("deduplication_policy", {})
+    reapp_cooldown = dedup_cfg.get("reapplication_cooldown_days", 90)
+    interview_cooldown = dedup_cfg.get("interview_company_exclusion_days", 365)
+    interview_kws = dedup_cfg.get("interview_stage_keywords", ['interview', 'hm round', 'panel', 'screen', 'working session'])
 
     content = read_file(file_path)
     current_section = ""
@@ -554,7 +539,7 @@ def parse_exclusions_from_pipeline(file_path):
                             excluded_job_ids.add(jid)
 
                 elif "Applied, No Update" in current_section:
-                    if days_ago < 90:
+                    if days_ago < reapp_cooldown:
                         if comp_norm and role_norm:
                             excluded_company_roles.add((comp_norm, role_norm))
                         for u in urls:
@@ -564,8 +549,8 @@ def parse_exclusions_from_pipeline(file_path):
                                 excluded_job_ids.add(jid)
 
                 elif "Rejected" in current_section or "Self Selected Out" in current_section:
-                    interviewed = any(kw in status_text.lower() for kw in ['interview', 'hm round', 'panel', 'screen', 'working session'])
-                    cutoff_days = 365 if interviewed else 90
+                    interviewed = any(kw in status_text.lower() for kw in interview_kws)
+                    cutoff_days = interview_cooldown if interviewed else reapp_cooldown
 
                     if days_ago < cutoff_days:
                         if interviewed and comp_norm:
@@ -614,12 +599,18 @@ def main():
     start_time = datetime.now()
     today_str = start_time.strftime("%b %d, %Y")
     logger.info("================================================================================")
-    logger.info(f"Starting IC PM US-Eligible Ground-Truth Job Discovery Engine at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Starting Ground-Truth Job Discovery Engine at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Data Directory Target: {DATA_DIR}")
+    logger.info(f"Config File Used: {CONFIG_FILE}")
     logger.info("================================================================================")
 
-    config = load_json(SOURCES_FILE)
+    config = load_json(CONFIG_FILE)
     news_sources = config.get("funding_news_sources", [])
+    filter_criteria = config.get("filter_criteria", {})
+
+    role_label = filter_criteria.get("role_category_label", "Individual Contributor (IC) Senior Roles")
+    min_salary = filter_criteria.get("min_base_salary_usd", 200000)
+    salary_str = f"${min_salary:,}+ base salary / equity" if min_salary else "Competitive Comp"
 
     # 1. Step 1: News Entity Extractor -> Auto-update Target Companies Config in Pipeline.md
     extract_funding_news_and_update_targets(news_sources)
@@ -630,6 +621,7 @@ def main():
 
     # 3. Discover Jobs for Target Companies (ATS APIs + Direct Website Scraping)
     discovered_raw_jobs = []
+    direct_keywords = filter_criteria.get("direct_career_site_keywords", [])
 
     for comp in target_companies:
         c_name = comp["name"]
@@ -638,15 +630,16 @@ def main():
         
         # Strategy B: Direct Website Career Page Scraping if ATS API yielded 0
         if not jobs:
-            jobs = scrape_jobs_directly_from_company_website(comp)
+            jobs = scrape_jobs_directly_from_company_website(comp, direct_keywords)
 
         if jobs:
             logger.info(f"Discovered {len(jobs)} live jobs for '{c_name}'")
             discovered_raw_jobs.extend(jobs)
 
     # 4. Filter & Evaluate Fit Scores
-    threshold = config.get("filter_criteria", {}).get("fit_score_threshold_percent", 75)
-    p_urls, p_jids, p_croles, p_c12m = parse_exclusions_from_pipeline(PIPELINE_FILE)
+    fit_cfg = filter_criteria.get("fit_scoring", {})
+    threshold = fit_cfg.get("fit_score_threshold_percent", 75)
+    p_urls, p_jids, p_croles, p_c12m = parse_exclusions_from_pipeline(PIPELINE_FILE, filter_criteria)
 
     accepted_leads = []
     filtered_already_considered_count = 0
@@ -659,9 +652,9 @@ def main():
         comp_text = item["comp"]
         domain_text = item["domain"]
 
-        if not is_ic_pm_role(role_title):
+        if not is_matching_role(role_title, filter_criteria):
             continue
-        if not is_us_eligible_location(loc_text, role_title):
+        if not is_eligible_location(loc_text, role_title, filter_criteria):
             continue
 
         already_considered, reason = is_already_considered(item, p_urls, p_jids, p_croles, p_c12m)
@@ -669,7 +662,7 @@ def main():
             filtered_already_considered_count += 1
             continue
 
-        fit_score = calculate_fit_score(role_title, domain_text, comp_text, comp_name)
+        fit_score = calculate_fit_score(role_title, domain_text, comp_text, comp_name, filter_criteria)
         if fit_score >= threshold:
             accepted_leads.append({
                 "company": comp_name,
@@ -691,13 +684,13 @@ def main():
 > [!INFO]
 > **Workflow Guide**:
 > - This file is automatically populated and updated by the `find-jobs` engine.
-> - **Inclusion Criteria**: Direct live US-eligible postings for Individual Contributor (IC) Senior Product Management roles ($200K+ base salary / equity), tech-focused, valuation ≥ $100M USD, or raised Series B/C/D+ funding in the last 6 months. Excludes People Management roles (Director, VP, Head of Product, GPM).
-> - **Fit Threshold**: Minimum **75% fit score** evaluated against [Profile.md](Profile.md) and candidate background.
+> - **Inclusion Criteria**: Direct live US-eligible postings for {role_label} ({salary_str}), valuation ≥ $100M USD, or raised Series B/C/D+ funding in the last 6 months.
+> - **Fit Threshold**: Minimum **{threshold}% fit score** evaluated against [Profile.md](Profile.md) and candidate background.
 > - **User Action**: Review these leads periodically. Move approved entries to `ToDo` in [Pipeline.md](Pipeline.md).
 
 ---
 
-## ⚡ Shortlisted Opportunities & Funded Startups (Fit Score ≥ 75%)
+## ⚡ Shortlisted Opportunities & Funded Startups (Fit Score ≥ {threshold}%)
 
 | Company | Stage / Funding | Role / Focus Area | Location | Base Pay / Comp | Fit Score | Status / Source | Date Added |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
