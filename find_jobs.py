@@ -55,6 +55,9 @@ if not os.path.exists(CONFIG_FILE):
 PROFILE_FILE = os.path.join(DATA_DIR, "Profile.md")
 PIPELINE_FILE = os.path.join(DATA_DIR, "Pipeline.md")
 JOB_LEADS_FILE = os.path.join(DATA_DIR, "job-leads.md")
+STEP1_FILE = os.path.join(DATA_DIR, "step1.md")
+STEP2_FILE = os.path.join(DATA_DIR, "step2.md")
+STEP3_FILE = os.path.join(DATA_DIR, "step3.md")
 LOGS_DIR = os.path.join(DATA_DIR, "logs")
 LOG_FILE = os.path.join(LOGS_DIR, "find_jobs.log")
 SUMMARY_JSON = os.path.join(LOGS_DIR, "latest_run_summary.json")
@@ -181,7 +184,169 @@ def append_new_target_company_to_pipeline(comp_name, reason, website, ats_info="
         return True
     return False
 
-def extract_funding_news_and_update_targets(news_sources):
+AGGREGATOR_DOMAINS = {
+    "techcrunch.com", "venturebeat.com", "crunchbase.com", "pitchbook.com",
+    "linkedin.com", "twitter.com", "x.com", "facebook.com", "youtube.com",
+    "github.com", "wikipedia.org", "medium.com", "news.ycombinator.com",
+    "bloomberg.com", "reuters.com", "wsj.com", "forbes.com",
+    "businessinsider.com", "prnewswire.com", "businesswire.com", "globenewswire.com"
+}
+
+NOISE_PREFIXES = [
+    r'^(?:As|The|AI|New|Startup|Tech|How|Why|What|After|With|About|For|In|On)\s+',
+    r'^(?:bot-detection startup|synthetic-user startup|edtech platform|training platform|battery storage startup|cloud security startup|cybersecurity startup|fintech startup|healthtech startup|medtech startup|biotech startup|stealth startup)\s+',
+    r'^(?:ery storage startup|ning platform|form)\s+'
+]
+
+def clean_company_name(name):
+    if not name:
+        return ""
+    clean = name.strip()
+    for pat in NOISE_PREFIXES:
+        clean = re.sub(pat, '', clean, flags=re.IGNORECASE).strip()
+    clean = re.sub(r'^[^\w]+', '', clean)
+    return clean
+
+def is_aggregator_domain(url):
+    try:
+        netloc = urllib.parse.urlparse(url).netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        for agg in AGGREGATOR_DOMAINS:
+            if agg in netloc:
+                return True
+        return False
+    except Exception:
+        return True
+
+def extract_article_links(article_url):
+    """Scrapes outbound links from a news article URL to find potential company domains."""
+    if not article_url:
+        return []
+    outbound_links = []
+    try:
+        r = curl_requests.get(article_url, impersonate="chrome", timeout=8)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("http") and not is_aggregator_domain(href):
+                    outbound_links.append(href)
+    except Exception as e:
+        logger.debug(f"Error fetching article links from {article_url}: {e}")
+    return list(dict.fromkeys(outbound_links))
+
+def search_ddg_html(query):
+    """Performs a DuckDuckGo HTML search and returns result link URLs."""
+    urls = []
+    try:
+        search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        r = curl_requests.get(search_url, impersonate="chrome", headers=headers, timeout=8)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", class_=re.compile(r"result__url|result__snippet|result__title"), href=True):
+                href = a["href"]
+                if "uddg=" in href:
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                    if "uddg" in parsed:
+                        href = parsed["uddg"][0]
+                if href.startswith("http") and not is_aggregator_domain(href):
+                    urls.append(href)
+    except Exception as e:
+        logger.debug(f"DDG search error for '{query}': {e}")
+    return list(dict.fromkeys(urls))
+
+def verify_and_select_best_domain(candidate_urls, company_name, news_context):
+    """Scrapes candidate landing pages and scores against news context to select official domain."""
+    if not candidate_urls:
+        slug = company_name.lower().replace(" ", "").replace(".", "")
+        return f"https://{slug}.com"
+
+    c_name_norm = company_name.lower().strip()
+    c_words = set(re.findall(r'\w+', c_name_norm))
+    ignore_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "raises", "raised", "funding", "series", "million", "billion"}
+    ctx_words = set(re.findall(r'\w+', news_context.lower())) - ignore_words
+
+    best_url = candidate_urls[0]
+    best_score = -1
+
+    for url in candidate_urls[:3]:
+        score = 0
+        try:
+            domain = urllib.parse.urlparse(url).netloc.lower()
+            if any(w in domain for w in c_words if len(w) >= 3):
+                score += 10
+
+            r = curl_requests.get(url, impersonate="chrome", timeout=6)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                title = (soup.title.string if soup.title else "").lower()
+                meta_desc = ""
+                meta_tag = soup.find("meta", attrs={"name": re.compile(r"description", re.I)}) or soup.find("meta", attrs={"property": re.compile(r"og:description", re.I)})
+                if meta_tag:
+                    meta_desc = (meta_tag.get("content") or "").lower()
+
+                combined_text = title + " " + meta_desc
+                if any(w in combined_text for w in c_words if len(w) >= 3):
+                    score += 15
+
+                overlap = len(ctx_words.intersection(set(re.findall(r'\w+', combined_text))))
+                score += overlap * 2
+
+                if score > best_score:
+                    best_score = score
+                    best_url = url
+        except Exception:
+            pass
+
+    return best_url.rstrip("/")
+
+def resolve_company_domain(company_name, news_context, article_url=None):
+    """3-stage domain resolution: 1. Article links, 2. Web search fallback, 3. Context verification."""
+    candidates = []
+    if article_url:
+        candidates = extract_article_links(article_url)
+    if not candidates:
+        candidates = search_ddg_html(f"{company_name} official website startup")
+    return verify_and_select_best_domain(candidates, company_name, news_context)
+
+def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website, ats_info="Auto", article_url=None, max_new_companies=100, current_session_count=0):
+    if current_session_count >= max_new_companies:
+        logger.warning(f"Reached max session limit of {max_new_companies} new companies added to Pipeline.md.")
+        return False, current_session_count
+
+    content = read_file(PIPELINE_FILE)
+    if not content or "### 🎯 Target Companies Config" not in content:
+        return False, current_session_count
+
+    comp_norm = comp_name.lower().strip()
+    if comp_norm in content.lower():
+        return False, current_session_count
+
+    today_str = datetime.now().strftime("%b %d, %Y")
+    notes = f"Added via News Sync ({reason})"
+    if article_url:
+        notes += f" | Article: {article_url}"
+    notes += f" - {today_str}"
+
+    new_row = f"| **{comp_name}** | {reason} | {website} | {ats_info} | {notes} |\n"
+    
+    parts = content.split("### 🎯 Target Companies Config\n")
+    if len(parts) == 2:
+        table_lines = parts[1].split("\n\n")[0]
+        updated_table = table_lines + "\n" + new_row.strip()
+        updated_content = parts[0] + "### 🎯 Target Companies Config\n" + parts[1].replace(table_lines, updated_table, 1)
+        with open(PIPELINE_FILE, "w", encoding="utf-8") as f:
+            f.write(updated_content)
+        current_session_count += 1
+        logger.info(f"Auto-added new funded company to Pipeline.md ({current_session_count}/{max_new_companies}): {comp_name} ({website})")
+        return True, current_session_count
+    return False, current_session_count
+
+def extract_funding_news_and_update_targets(news_sources, max_new_companies=100):
     logger.info("Extracting funded startup entity leads from news sources...")
     funding_patterns = [
         re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,25})\s+(?:raises|raised|secures|secured|snags|snagged|bags|bagged|nabs|nabbed|closes|closed|lands|landed)\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?(?:\s+(?:Series\s+[A-E]|growth|funding|valuation))?)', re.IGNORECASE),
@@ -189,8 +354,11 @@ def extract_funding_news_and_update_targets(news_sources):
     ]
 
     discovered_companies = []
+    session_count = 0
 
     for src in news_sources:
+        if session_count >= max_new_companies:
+            break
         s_name = src["name"]
         s_url = src["url"]
         try:
@@ -199,24 +367,29 @@ def extract_funding_news_and_update_targets(news_sources):
                 record_log(s_name, s_url, "Success (200)", f"Fetched news feed successfully ({len(r.text)} bytes)")
                 soup = BeautifulSoup(r.text, "html.parser")
                 
-                headlines = []
-                for tag in soup.find_all(['h1', 'h2', 'h3', 'a']):
-                    txt = sanitize_text(tag.get_text())
-                    if len(txt) > 15:
-                        headlines.append(txt)
+                for a in soup.find_all('a', href=True):
+                    txt = sanitize_text(a.get_text())
+                    href = a['href']
+                    if not href.startswith("http"):
+                        href = requests.compat.urljoin(s_url, href)
 
-                for txt in headlines:
-                    for pat in funding_patterns:
-                        m = pat.search(txt)
-                        if m:
-                            comp = m.group(1).strip()
-                            fund = m.group(2).strip()
-                            comp_clean = re.sub(r'^(?:As|The|AI|New|Startup|Tech|How|Why|What|After|With)\s+', '', comp, flags=re.IGNORECASE).strip()
-                            if len(comp_clean) >= 3 and not any(w in comp_clean.lower() for w in ['series', 'million', 'billion', 'funding', 'round', 'investor', 'capital']):
-                                website = f"https://{comp_clean.lower().replace(' ', '')}.com"
-                                reason = f"Funding News ({s_name}: {fund})"
-                                if append_new_target_company_to_pipeline(comp_clean, reason, website):
-                                    discovered_companies.append(comp_clean)
+                    if len(txt) > 15:
+                        for pat in funding_patterns:
+                            m = pat.search(txt)
+                            if m:
+                                comp_raw = m.group(1).strip()
+                                fund = m.group(2).strip()
+                                comp_clean = clean_company_name(comp_raw)
+                                
+                                if len(comp_clean) >= 3 and not any(w in comp_clean.lower() for w in ['series', 'million', 'billion', 'funding', 'round', 'investor', 'capital']):
+                                    website = resolve_company_domain(comp_clean, txt, href)
+                                    reason = f"Funding News ({s_name}: {fund})"
+                                    added, session_count = append_new_target_company_to_pipeline_with_limit(
+                                        comp_clean, reason, website, ats_info="Auto", article_url=href,
+                                        max_new_companies=max_new_companies, current_session_count=session_count
+                                    )
+                                    if added:
+                                        discovered_companies.append(comp_clean)
             else:
                 record_log(s_name, s_url, f"HTTP Error ({r.status_code})", "Non-200 response from news source")
         except Exception as e:
@@ -224,103 +397,112 @@ def extract_funding_news_and_update_targets(news_sources):
 
     return discovered_companies
 
-# --- Job Discovery Strategies ---
+# --- Job Discovery Strategies (Multi-Probe) ---
 
 def fetch_jobs_from_ats_api(company):
     c_name = company["name"]
     slug = company["slug"]
     ats_pref = company["ats"]
+    website = company.get("website", "")
     found_jobs = []
 
-    # Check Ashby
+    # Derive slug candidates from company name and website domain
+    domain_slug = ""
+    if website:
+        netloc = urllib.parse.urlparse(website).netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        domain_slug = netloc.split(".")[0]
+
+    slug_candidates = list(dict.fromkeys([
+        slug,
+        c_name.lower().replace(" ", "").replace(".", ""),
+        domain_slug,
+        f"{domain_slug}hq",
+        f"{domain_slug}-ai"
+    ]))
+    slug_candidates = [s for s in slug_candidates if s and len(s) >= 2]
+
+    # Probe Ashby
     if ats_pref in ("Ashby", "Auto"):
-        ashby_url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
-        try:
-            r = requests.get(ashby_url, timeout=6)
-            if r.status_code == 200:
-                jobs = r.json().get("jobs", [])
-                record_log(f"{c_name} (Ashby)", ashby_url, "Success (200)", f"Discovered {len(jobs)} total jobs")
-                for j in jobs:
-                    title = sanitize_text(j.get("title"))
-                    loc = sanitize_text(j.get("locationName") or "US (Remote / On-site)")
-                    job_url = j.get("jobUrl") or f"https://jobs.ashbyhq.com/{slug}/{j.get('id')}"
-                    found_jobs.append({
-                        "company": c_name,
-                        "title": title,
-                        "location": loc,
-                        "url": job_url,
-                        "source": f"{c_name} (Ashby API)",
-                        "comp": "$200K - $350K + Equity",
-                        "domain": f"AI Startup ({c_name})"
-                    })
-                if found_jobs:
-                    return found_jobs
-            elif r.status_code == 403:
-                record_log(f"{c_name} (Ashby)", ashby_url, "HTTP 403", "Cloudflare / Bot Protection Active")
-            else:
-                record_log(f"{c_name} (Ashby)", ashby_url, f"HTTP {r.status_code}", "Endpoint returned non-200")
-        except Exception as e:
-            record_log(f"{c_name} (Ashby)", ashby_url, "Error", str(e))
+        for s in slug_candidates:
+            ashby_url = f"https://api.ashbyhq.com/posting-api/job-board/{s}"
+            try:
+                r = requests.get(ashby_url, timeout=6)
+                if r.status_code == 200:
+                    jobs = r.json().get("jobs", [])
+                    if jobs:
+                        record_log(f"{c_name} (Ashby)", ashby_url, "Success (200)", f"Discovered {len(jobs)} total jobs")
+                        for j in jobs:
+                            title = sanitize_text(j.get("title"))
+                            loc = sanitize_text(j.get("locationName") or "US (Remote / On-site)")
+                            job_url = j.get("jobUrl") or f"https://jobs.ashbyhq.com/{s}/{j.get('id')}"
+                            found_jobs.append({
+                                "company": c_name,
+                                "title": title,
+                                "location": loc,
+                                "url": job_url,
+                                "source": f"{c_name} (Ashby API)",
+                                "comp": "$200K - $350K + Equity",
+                                "domain": f"AI Startup ({c_name})"
+                            })
+                        return found_jobs
+            except Exception as e:
+                logger.debug(f"Ashby probe error for {c_name} ({s}): {e}")
 
-    # Check Greenhouse
+    # Probe Greenhouse
     if ats_pref in ("Greenhouse", "Auto"):
-        gh_url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-        try:
-            r = requests.get(gh_url, timeout=6)
-            if r.status_code == 200:
-                jobs = r.json().get("jobs", [])
-                record_log(f"{c_name} (Greenhouse)", gh_url, "Success (200)", f"Discovered {len(jobs)} total jobs")
-                for j in jobs:
-                    title = sanitize_text(j.get("title"))
-                    loc = sanitize_text(j.get("location", {}).get("name") or "US (Remote / On-site)")
-                    job_url = j.get("absolute_url")
-                    found_jobs.append({
-                        "company": c_name,
-                        "title": title,
-                        "location": loc,
-                        "url": job_url,
-                        "source": f"{c_name} (Greenhouse API)",
-                        "comp": "$200K - $350K + Equity",
-                        "domain": f"AI Startup ({c_name})"
-                    })
-                if found_jobs:
-                    return found_jobs
-            elif r.status_code == 403:
-                record_log(f"{c_name} (Greenhouse)", gh_url, "HTTP 403", "Cloudflare / Bot Protection Active")
-            else:
-                record_log(f"{c_name} (Greenhouse)", gh_url, f"HTTP {r.status_code}", "Endpoint returned non-200")
-        except Exception as e:
-            record_log(f"{c_name} (Greenhouse)", gh_url, "Error", str(e))
+        for s in slug_candidates:
+            gh_url = f"https://boards-api.greenhouse.io/v1/boards/{s}/jobs"
+            try:
+                r = requests.get(gh_url, timeout=6)
+                if r.status_code == 200:
+                    jobs = r.json().get("jobs", [])
+                    if jobs:
+                        record_log(f"{c_name} (Greenhouse)", gh_url, "Success (200)", f"Discovered {len(jobs)} total jobs")
+                        for j in jobs:
+                            title = sanitize_text(j.get("title"))
+                            loc = sanitize_text(j.get("location", {}).get("name") or "US (Remote / On-site)")
+                            job_url = j.get("absolute_url")
+                            found_jobs.append({
+                                "company": c_name,
+                                "title": title,
+                                "location": loc,
+                                "url": job_url,
+                                "source": f"{c_name} (Greenhouse API)",
+                                "comp": "$200K - $350K + Equity",
+                                "domain": f"AI Startup ({c_name})"
+                            })
+                        return found_jobs
+            except Exception as e:
+                logger.debug(f"Greenhouse probe error for {c_name} ({s}): {e}")
 
-    # Check Lever
+    # Probe Lever
     if ats_pref in ("Lever", "Auto"):
-        lever_url = f"https://api.lever.co/v0/postings/{slug}"
-        try:
-            r = requests.get(lever_url, timeout=6)
-            if r.status_code == 200:
-                jobs = r.json()
-                record_log(f"{c_name} (Lever)", lever_url, "Success (200)", f"Discovered {len(jobs)} total jobs")
-                for j in jobs:
-                    title = sanitize_text(j.get("text"))
-                    loc = sanitize_text(j.get("categories", {}).get("location") or "US (Remote / On-site)")
-                    job_url = j.get("hostedUrl")
-                    found_jobs.append({
-                        "company": c_name,
-                        "title": title,
-                        "location": loc,
-                        "url": job_url,
-                        "source": f"{c_name} (Lever API)",
-                        "comp": "$200K - $350K + Equity",
-                        "domain": f"AI Startup ({c_name})"
-                    })
-                if found_jobs:
-                    return found_jobs
-            elif r.status_code == 403:
-                record_log(f"{c_name} (Lever)", lever_url, "HTTP 403", "Cloudflare / Bot Protection Active")
-            else:
-                record_log(f"{c_name} (Lever)", lever_url, f"HTTP {r.status_code}", "Endpoint returned non-200")
-        except Exception as e:
-            record_log(f"{c_name} (Lever)", lever_url, "Error", str(e))
+        for s in slug_candidates:
+            lever_url = f"https://api.lever.co/v0/postings/{s}"
+            try:
+                r = requests.get(lever_url, timeout=6)
+                if r.status_code == 200:
+                    jobs = r.json()
+                    if isinstance(jobs, list) and jobs:
+                        record_log(f"{c_name} (Lever)", lever_url, "Success (200)", f"Discovered {len(jobs)} total jobs")
+                        for j in jobs:
+                            title = sanitize_text(j.get("text"))
+                            loc = sanitize_text(j.get("categories", {}).get("location") or "US (Remote / On-site)")
+                            job_url = j.get("hostedUrl")
+                            found_jobs.append({
+                                "company": c_name,
+                                "title": title,
+                                "location": loc,
+                                "url": job_url,
+                                "source": f"{c_name} (Lever API)",
+                                "comp": "$200K - $350K + Equity",
+                                "domain": f"AI Startup ({c_name})"
+                            })
+                        return found_jobs
+            except Exception as e:
+                logger.debug(f"Lever probe error for {c_name} ({s}): {e}")
 
     return found_jobs
 
@@ -366,14 +548,93 @@ def scrape_jobs_directly_from_company_website(company, direct_keywords):
                         })
                 if found_jobs:
                     break
-            elif r.status_code in (403, 401):
-                record_log(f"{c_name} Website", c_url, f"HTTP {r.status_code}", "Cloudflare / Login required barrier")
-            else:
-                record_log(f"{c_name} Website", c_url, f"HTTP {r.status_code}", "Careers page not found / Non-200")
         except Exception as e:
-            record_log(f"{c_name} Website", c_url, "Error / Failure", str(e))
+            logger.debug(f"Error scraping career site {c_url}: {e}")
 
     return found_jobs
+
+def web_search_careers_page_fallback(company):
+    """Probe 3: Web search for company careers/jobs page if ATS and direct site probing yield 0 jobs."""
+    c_name = company["name"]
+    found_jobs = []
+    search_results = search_ddg_html(f"{c_name} careers jobs ashby OR greenhouse OR lever")
+
+    for url in search_results[:3]:
+        try:
+            r = curl_requests.get(url, impersonate="chrome", timeout=8)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                links = soup.find_all("a", href=True)
+                for link in links:
+                    t_text = sanitize_text(link.get_text())
+                    href = link["href"]
+                    if not href.startswith("http"):
+                        href = requests.compat.urljoin(url, href)
+                    if len(t_text) >= 8 and any(kw in t_text.lower() for kw in ['product manager', 'lead', 'senior', 'principal', 'staff', 'manager']):
+                        found_jobs.append({
+                            "company": c_name,
+                            "title": t_text,
+                            "location": "US (Remote / On-site)",
+                            "url": href,
+                            "source": f"{c_name} Web Search Careers Link",
+                            "comp": "$200K - $350K + Equity",
+                            "domain": f"Web Search Discovery ({c_name})"
+                        })
+                if found_jobs:
+                    record_log(f"{c_name} Web Search", url, "Success (200)", f"Discovered {len(found_jobs)} jobs via web search fallback")
+                    break
+        except Exception as e:
+            logger.debug(f"Web search careers fallback error for {c_name} ({url}): {e}")
+
+    return found_jobs
+
+def fetch_web_source(source_info):
+    name = source_info["name"]
+    url = source_info["url"]
+    stype = source_info["type"]
+    jobs = []
+
+    try:
+        r = curl_requests.get(url, impersonate="chrome", timeout=10)
+        if r.status_code in (200, 301, 302):
+            soup = BeautifulSoup(r.text, "html.parser")
+            links = soup.find_all("a", href=True)
+            seen_titles = set()
+            for link in links:
+                t_text = sanitize_text(link.get_text())
+                href = link["href"]
+                if not href.startswith("http"):
+                    href = requests.compat.urljoin(url, href)
+                
+                if len(t_text) >= 8 and t_text.lower() not in ("home", "about", "careers", "privacy", "terms", "jobs", "login", "sign up", "learn more"):
+                    if t_text not in seen_titles:
+                        seen_titles.add(t_text)
+                        jobs.append({
+                            "company": name,
+                            "title": t_text,
+                            "location": "US / Unspecified",
+                            "url": href,
+                            "source": f"{name} ({stype})",
+                            "comp": "Unspecified",
+                            "domain": f"{stype} Feed"
+                        })
+    except Exception as e:
+        record_log(name, url, "Error", str(e))
+
+    return jobs
+
+def discover_raw_jobs_for_company(company, direct_keywords):
+    """Executes 3-tier multi-probe strategy for a target company."""
+    # Probe 1: ATS APIs
+    jobs = fetch_jobs_from_ats_api(company)
+    # Probe 2: Direct Website Career Pages
+    if not jobs:
+        jobs = scrape_jobs_directly_from_company_website(company, direct_keywords)
+    # Probe 3: Web Search Fallback for Careers
+    if not jobs:
+        jobs = web_search_careers_page_fallback(company)
+    return jobs
+
 
 # --- Filtering & Deduplication ---
 
@@ -593,6 +854,110 @@ def is_already_considered(job, excluded_urls, excluded_job_ids, excluded_company
 
     return False, ""
 
+# --- Pipeline Phase Functions (Exposed for Debug Harness & Engine Execution) ---
+
+def collect_all_raw_jobs(config, max_new_companies=100):
+    """Step 1: Discover companies from funding news, sync Pipeline.md, and run multi-probe discovery across target companies and web feeds."""
+    news_sources = config.get("funding_news_sources", [])
+    filter_criteria = config.get("filter_criteria", {})
+    direct_keywords = filter_criteria.get("direct_career_site_keywords", [])
+
+    # 1. Scrape funding news, resolve domains, and update target companies in Pipeline.md (capped at max_new_companies)
+    extract_funding_news_and_update_targets(news_sources, max_new_companies=max_new_companies)
+
+    # 2. Parse target companies from Pipeline.md
+    target_companies = parse_target_companies_from_pipeline()
+    logger.info(f"Loaded {len(target_companies)} target companies from Pipeline.md.")
+
+    raw_jobs = []
+
+    # 3. Multi-probe discovery for each target company
+    for comp in target_companies:
+        jobs = discover_raw_jobs_for_company(comp, direct_keywords)
+        if jobs:
+            logger.info(f"Discovered {len(jobs)} raw jobs for target company '{comp['name']}'")
+            raw_jobs.extend(jobs)
+
+    # 4. Web sources discovery feeds from config.json
+    for src in config.get("job_sources", []):
+        if src.get("type") in ("job_board", "curated_jobs", "curated_pm_jobs", "tech_news"):
+            jobs = fetch_web_source(src)
+            if jobs:
+                logger.info(f"Discovered {len(jobs)} raw jobs from web feed '{src['name']}'")
+                raw_jobs.extend(jobs)
+
+    return raw_jobs
+
+def filter_and_score_jobs(raw_jobs, filter_criteria):
+    """Step 2: Apply role matching, location eligibility, and fit score threshold evaluation."""
+    threshold = filter_criteria.get("fit_scoring", {}).get("fit_score_threshold_percent", 75)
+    filtered_jobs = []
+    step2_evaluations = []
+
+    for j in raw_jobs:
+        role_pass = is_matching_role(j["title"], filter_criteria)
+        loc_pass = is_eligible_location(j["location"], j["title"], filter_criteria)
+
+        if not role_pass:
+            status = "Rejected (Role Mismatch)"
+            is_passed = False
+        elif not loc_pass:
+            status = "Rejected (Location Non-US)"
+            is_passed = False
+        else:
+            score = calculate_fit_score(j["title"], j["domain"], j["comp"], j["company"], filter_criteria)
+            if score >= threshold:
+                status = f"PASSED ({score}%)"
+                is_passed = True
+                filtered_jobs.append(j)
+            else:
+                status = f"Rejected (Low Fit Score: {score}%)"
+                is_passed = False
+
+        step2_evaluations.append({
+            "job": j,
+            "status": status,
+            "passed": is_passed
+        })
+
+    return filtered_jobs, step2_evaluations
+
+def deduplicate_jobs(filtered_jobs, filter_criteria):
+    """Step 3: Deduplicate filtered jobs against Pipeline.md rules."""
+    p_urls, p_jids, p_croles, p_c12m = parse_exclusions_from_pipeline(PIPELINE_FILE, filter_criteria)
+    accepted_leads = []
+    step3_records = []
+    today_str = datetime.now().strftime("%b %d, %Y")
+
+    for j in filtered_jobs:
+        already_considered, reason = is_already_considered(j, p_urls, p_jids, p_croles, p_c12m)
+        if already_considered:
+            step3_records.append({
+                "job": j,
+                "status": "EXCLUDED",
+                "reason": reason
+            })
+        else:
+            step3_records.append({
+                "job": j,
+                "status": "NEW LEAD",
+                "reason": "N/A"
+            })
+            score = calculate_fit_score(j["title"], j["domain"], j["comp"], j["company"], filter_criteria)
+            accepted_leads.append({
+                "company": j["company"],
+                "stage": "High-Growth Funded Startup",
+                "role": j["title"],
+                "location": j["location"],
+                "comp": j["comp"],
+                "fit_score": f"{score}%",
+                "source": j["source"],
+                "url": j["url"],
+                "date_added": today_str
+            })
+
+    return accepted_leads, step3_records
+
 # --- Main Engine Execution ---
 
 def main():
@@ -605,78 +970,26 @@ def main():
     logger.info("================================================================================")
 
     config = load_json(CONFIG_FILE)
-    news_sources = config.get("funding_news_sources", [])
     filter_criteria = config.get("filter_criteria", {})
 
     role_label = filter_criteria.get("role_category_label", "Individual Contributor (IC) Senior Roles")
     min_salary = filter_criteria.get("min_base_salary_usd", 200000)
     salary_str = f"${min_salary:,}+ base salary / equity" if min_salary else "Competitive Comp"
 
-    # 1. Step 1: News Entity Extractor -> Auto-update Target Companies Config in Pipeline.md
-    extract_funding_news_and_update_targets(news_sources)
+    # Step 1: Collect Raw Jobs
+    raw_jobs = collect_all_raw_jobs(config, max_new_companies=100)
+    logger.info(f"Step 1 Complete: Discovered {len(raw_jobs)} total raw job postings.")
 
-    # 2. Parse Target Companies Config from Pipeline.md
-    target_companies = parse_target_companies_from_pipeline()
-    logger.info(f"Loaded {len(target_companies)} target companies from Pipeline.md Command Center.")
+    # Step 2: Role, Location & Fit Score Filtering
+    filtered_jobs, step2_evals = filter_and_score_jobs(raw_jobs, filter_criteria)
+    logger.info(f"Step 2 Complete: {len(filtered_jobs)} jobs passed fit score threshold.")
 
-    # 3. Discover Jobs for Target Companies (ATS APIs + Direct Website Scraping)
-    discovered_raw_jobs = []
-    direct_keywords = filter_criteria.get("direct_career_site_keywords", [])
+    # Step 3: Deduplicate against Pipeline.md
+    accepted_leads, step3_records = deduplicate_jobs(filtered_jobs, filter_criteria)
+    logger.info(f"Step 3 Complete: {len(accepted_leads)} new qualifying leads ready for job-leads.md.")
 
-    for comp in target_companies:
-        c_name = comp["name"]
-        # Strategy A: ATS API Check
-        jobs = fetch_jobs_from_ats_api(comp)
-        
-        # Strategy B: Direct Website Career Page Scraping if ATS API yielded 0
-        if not jobs:
-            jobs = scrape_jobs_directly_from_company_website(comp, direct_keywords)
-
-        if jobs:
-            logger.info(f"Discovered {len(jobs)} live jobs for '{c_name}'")
-            discovered_raw_jobs.extend(jobs)
-
-    # 4. Filter & Evaluate Fit Scores
-    fit_cfg = filter_criteria.get("fit_scoring", {})
-    threshold = fit_cfg.get("fit_score_threshold_percent", 75)
-    p_urls, p_jids, p_croles, p_c12m = parse_exclusions_from_pipeline(PIPELINE_FILE, filter_criteria)
-
-    accepted_leads = []
-    filtered_already_considered_count = 0
-
-    for item in discovered_raw_jobs:
-        comp_name = item["company"]
-        role_title = item["title"]
-        loc_text = item["location"]
-        url = item["url"]
-        comp_text = item["comp"]
-        domain_text = item["domain"]
-
-        if not is_matching_role(role_title, filter_criteria):
-            continue
-        if not is_eligible_location(loc_text, role_title, filter_criteria):
-            continue
-
-        already_considered, reason = is_already_considered(item, p_urls, p_jids, p_croles, p_c12m)
-        if already_considered:
-            filtered_already_considered_count += 1
-            continue
-
-        fit_score = calculate_fit_score(role_title, domain_text, comp_text, comp_name, filter_criteria)
-        if fit_score >= threshold:
-            accepted_leads.append({
-                "company": comp_name,
-                "stage": "High-Growth Funded Startup",
-                "role": role_title,
-                "location": loc_text,
-                "comp": comp_text,
-                "fit_score": f"{fit_score}%",
-                "source": item["source"],
-                "url": url,
-                "date_added": today_str
-            })
-
-    # 5. Write Output to job-leads.md
+    # Write Output to job-leads.md
+    threshold = filter_criteria.get("fit_scoring", {}).get("fit_score_threshold_percent", 75)
     header_content = f"""# Job Leads & High-Growth Startup Discovery
 
 *Last processed: {today_str}*
@@ -726,10 +1039,10 @@ def main():
 
     logger.info("================================================================================")
     logger.info(f"Engine Execution Finished in {duration}s.")
-    logger.info(f"Target Companies Scanned: {len(target_companies)}")
     logger.info(f"Accepted Qualifying Leads: {len(accepted_leads)}")
     logger.info(f"Scraping Logs Written to job-leads.md ({len(GLOBAL_SCRAPE_LOGS)} log entries)")
     logger.info("================================================================================")
 
 if __name__ == "__main__":
     main()
+

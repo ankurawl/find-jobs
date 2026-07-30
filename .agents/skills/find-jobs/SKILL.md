@@ -13,8 +13,16 @@ This skill defines the instructions and automated workflow for discovering high-
 - Target data directory contains `Profile.md`, `Pipeline.md`, `config.json`, and `job-leads.md`.
 
 ## Core Rules & Criteria
-1. **Virtual Environment**: ALWAYS use the Python virtual environment located at `/home/agag/Documents/find-jobs/.venv/bin/python` for executing `/home/agag/Documents/find-jobs/find_jobs.py`.
-2. **Sources & Config**: Reads job sources, funding feeds, role title patterns, and filtering rules from `config.json` in the configured `JOB_DATA_DIR` (falls back to `personal-files/config.example.json`).
+1. **Virtual Environment**: ALWAYS use the Python virtual environment located at `/home/agag/Documents/find-jobs/.venv/bin/python` for executing `/home/agag/Documents/find-jobs/find_jobs.py` or `debug_job_finder.py`.
+2. **Sources & Dynamic Discovery**:
+   - **Funding News Entity Extractor**: Scrapes news sources from `funding_news_sources` in `config.json` (TechCrunch, VentureBeat, Crunchbase News, etc.) to discover newly funded startups.
+   - **Domain Resolution & Verification**: Resolves company website domains via outbound article link parsing, DuckDuckGo HTML web search fallback, and landing page content/meta verification.
+   - **Target Sync Limit**: Appends newly discovered target companies to `Pipeline.md` under `### 🎯 Target Companies Config` up to a **max limit of 100 new companies per session**.
+   - **Multi-Probe Career Discovery**:
+     - *Probe 1*: Major ATS platform APIs (`Ashby`, `Greenhouse`, `Lever`) using derived company slugs.
+     - *Probe 2*: Direct website career pages (`/careers`, `/jobs`, `/about/careers`, `/join-us`).
+     - *Probe 3*: Targeted web search fallback for career/jobs portal links.
+     - *Discovery Feeds*: Uses `job_sources` in `config.json` as active discovery probe roots.
 3. **Filtering Rules**:
    - **Funding / Valuation**: Private companies must have raised Series B, C, D+ in the last 6 months, or have a valuation/market cap ≥ $100M USD.
    - **US Market & Location**: US-focused opportunities (On-site, Remote, or Hybrid). Candidate is based in Austin but open to relocation/travel.
@@ -31,6 +39,7 @@ This skill defines the instructions and automated workflow for discovering high-
 
 ## How to Trigger
 - **Manual Trigger**: Simply say **"find jobs"**, **"search for jobs"**, or **"run find jobs"**.
+- **Debug Inspection**: Run `debug_job_finder.py` to inspect intermediate outputs (`step1.md`, `step2.md`, `step3.md`).
 - **Automated Schedule**: Runs automatically every night at 2:00 AM.
 
 ---
@@ -41,6 +50,11 @@ This skill defines the instructions and automated workflow for discovering high-
 Execute the job discovery engine script using the repo's virtual environment:
 ```bash
 /home/agag/Documents/find-jobs/.venv/bin/python /home/agag/Documents/find-jobs/find_jobs.py
+```
+
+For step-by-step debug inspection (generating `step1.md`, `step2.md`, `step3.md`):
+```bash
+/home/agag/Documents/find-jobs/.venv/bin/python /home/agag/Documents/find-jobs/debug_job_finder.py
 ```
 
 ### Step 2: Review and Format Output
