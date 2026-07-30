@@ -601,12 +601,18 @@ def extract_job_details_from_link(href, text, source_name):
     if not text_clean or len(text_clean) < 3:
         return None
 
-    # 1. Non-job URL blacklist
+    # 1. Non-job URL blacklist (including corporate SaaS marketing paths)
     ignored_url_patterns = [
         "/categories/", "/investors/", "/stages/", "/industries/", "/locations/",
-        "/faq/", "/salaries", "/companies", "/hire", "/privacy", "/terms",
+        "/faq/", "/salaries", "/companies", "/hire", "/privacy", "/terms", "/legal",
         "/login", "/signup", "tally.so", "/tech-topics", "/tech-hubs",
-        "/tech-dictionary", "/about", "/news", "/category/", "/blogs/", "/post/"
+        "/tech-dictionary", "/about", "/news", "/category/", "/blogs/", "/post/",
+        "/demo", "/pricing", "/security", "/roi", "/events", "/webinars",
+        "/customer-stories", "/glossary", "/onboarding", "/integrations",
+        "/content-topic/", "/compare", "/platform", "/enterprise", "/support",
+        "/guidance", "/resources", "/talent-makers", "/latest-features",
+        "learn.greenhouse.io", "support.greenhouse.io", "developers.greenhouse.io",
+        "my.greenhouse.com", "app.greenhouse.io"
     ]
     if any(pat in url_lower for pat in ignored_url_patterns):
         return None
@@ -620,14 +626,31 @@ def extract_job_details_from_link(href, text, source_name):
         "cookie policy", "contact us", "help center", "all tech jobs", "tech companies",
         "companies hiring remotely", "fully remote companies", "tech + startup salaries",
         "tech news", "tech hubs", "explore employer solutions", "explore 100k+ companies",
-        "articles", "employers / post job", "join our talent pool", "beta"
+        "articles", "employers / post job", "join our talent pool", "beta", "request a demo",
+        "get support", "developer resources", "press & awards", "terms of service",
+        "skip to content", "close mobile", "greenhouse home link", "ai recruiting",
+        "talent sourcing", "candidate experience", "scalable workflows", "interviewing",
+        "talent matching", "onboarding", "reporting & insights", "integrations",
+        "early-stage business", "scaling company", "modern enterprise", "job seekers",
+        "how we compare", "return on your hiring", "your partner in success", "guidance"
     ]
-    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at"]):
+    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at", "request a demo", "skip to content"]):
         return None
 
     company = ""
     title = text_clean
     location = "US / Unspecified"
+
+    # Known ATS root domain check: if URL is an ATS domain without a company slug & job ID, discard it
+    if any(host in url_lower for host in ["greenhouse.io", "ashbyhq.com", "lever.co"]):
+        is_valid_ats_job = (
+            re.search(r'greenhouse\.io/([^/]+)/jobs/', href, re.IGNORECASE) or
+            re.search(r'greenhouse\.io/embed/job_board\?for=([^&]+)', href, re.IGNORECASE) or
+            re.search(r'ashbyhq\.com/([^/]+)/[a-f0-9-]+', href, re.IGNORECASE) or
+            re.search(r'lever\.co/([^/]+)/[a-f0-9-]+', href, re.IGNORECASE)
+        )
+        if not is_valid_ats_job:
+            return None
 
     # Slug mapping for clean company names
     SLUG_NAME_OVERRIDES = {
@@ -722,9 +745,10 @@ def extract_job_details_from_link(href, text, source_name):
             host_parts = parsed_url.netloc.split(".")
             if len(host_parts) >= 2:
                 company = host_parts[-2].capitalize()
-    
-    if not company:
-        company = f"Company via {source_name}"
+
+    # Discard any entry where real company could not be resolved or is a generic placeholder
+    if not company or company.lower() in ("greenhouse", "ashby", "lever", "company", "unknown") or company.startswith("Company via"):
+        return None
 
     if len(title) < 4:
         return None
@@ -1031,7 +1055,11 @@ def collect_all_raw_jobs(config, max_new_companies=100):
 
     # 4. Web sources discovery feeds from config.json
     for src in config.get("job_sources", []):
-        if src.get("type") in ("job_board", "curated_jobs", "curated_pm_jobs", "tech_news", "ats_board", "funding_and_jobs"):
+        stype = src.get("type", "")
+        surl = src.get("url", "").lower()
+        if stype == "ats_board" or any(base in surl for base in ["job-boards.greenhouse.io", "jobs.ashbyhq.com", "jobs.lever.co"]):
+            continue
+        if stype in ("job_board", "curated_jobs", "curated_pm_jobs", "tech_news", "funding_and_jobs"):
             jobs = fetch_web_source(src)
             if jobs:
                 logger.info(f"Discovered {len(jobs)} raw jobs from web feed '{src['name']}'")
