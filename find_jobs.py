@@ -601,18 +601,22 @@ def extract_job_details_from_link(href, text, source_name):
     if not text_clean or len(text_clean) < 3:
         return None
 
-    # 1. Non-job URL blacklist (including corporate SaaS marketing paths)
+    # 1. Non-job URL blacklist (including corporate SaaS marketing paths & external news/media domains)
     ignored_url_patterns = [
-        "/categories/", "/investors/", "/stages/", "/industries/", "/locations/",
-        "/faq/", "/salaries", "/companies", "/hire", "/privacy", "/terms", "/legal",
+        "/categories", "/investors", "/stages", "/industries", "/locations",
+        "/faq", "/salaries", "/companies", "/hire", "/privacy", "/terms", "/legal",
         "/login", "/signup", "tally.so", "/tech-topics", "/tech-hubs",
         "/tech-dictionary", "/about", "/news", "/category/", "/blogs/", "/post/",
         "/demo", "/pricing", "/security", "/roi", "/events", "/webinars",
         "/customer-stories", "/glossary", "/onboarding", "/integrations",
         "/content-topic/", "/compare", "/platform", "/enterprise", "/support",
-        "/guidance", "/resources", "/talent-makers", "/latest-features",
+        "/guidance", "/resources", "/talent-makers", "/latest-features", "/sponsor",
         "learn.greenhouse.io", "support.greenhouse.io", "developers.greenhouse.io",
-        "my.greenhouse.com", "app.greenhouse.io"
+        "my.greenhouse.com", "app.greenhouse.io", "techcrunch.com", "finsmes.com",
+        "upstartsmedia.com", "fundraiseinsider.com", "reuters.com", "citybiz.co",
+        "yahoo.com", "linkedin.com", "twitter.com", "x.com", "github.com", "medium.com",
+        "gonzija.com", "candidhealth.com", "natural.com", "monumental.co", "htworld.co.uk",
+        "prnewswire.com", "businesswire.com"
     ]
     if any(pat in url_lower for pat in ignored_url_patterns):
         return None
@@ -632,9 +636,10 @@ def extract_job_details_from_link(href, text, source_name):
         "talent sourcing", "candidate experience", "scalable workflows", "interviewing",
         "talent matching", "onboarding", "reporting & insights", "integrations",
         "early-stage business", "scaling company", "modern enterprise", "job seekers",
-        "how we compare", "return on your hiring", "your partner in success", "guidance"
+        "how we compare", "return on your hiring", "your partner in success", "guidance",
+        "source", "link", "see all investors", "categories", "explore", "sponsor", "investors"
     ]
-    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at", "request a demo", "skip to content"]):
+    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at", "request a demo", "skip to content", "see all investors"]):
         return None
 
     company = ""
@@ -760,41 +765,117 @@ def extract_job_details_from_link(href, text, source_name):
         "url": href
     }
 
-def fetch_web_source(source_info):
+UNREACHED_DEPTH_FILE = os.path.join(LOGS_DIR, "deep_crawl_unreached_report.md")
+
+def is_valid_subpage_link(url, parent_domain):
+    """Checks if a URL is an internal directory/company subpage worth traversing up to Depth 5."""
+    url_lower = url.lower()
+    
+    # Blacklisted non-job navigation & index paths
+    blacklist = [
+        "/investors", "/stages/", "/industries/", "/locations/", "/faq", "/salaries",
+        "/privacy", "/terms", "/legal", "/login", "/signup", "tally.so", "/tech-topics",
+        "/tech-hubs", "/tech-dictionary", "/about", "/blogs", "/post", "/demo", "/pricing",
+        "/security", "/roi", "/events", "/webinars", "/customer-stories", "/glossary",
+        "/onboarding", "/integrations", "/content-topic", "/compare", "/platform",
+        "/enterprise", "/support", "/guidance", "/resources", "/talent-makers", "/sponsor"
+    ]
+    if any(pat in url_lower for pat in blacklist):
+        return False
+
+    parsed = urllib.parse.urlparse(url)
+    netloc = parsed.netloc.lower()
+
+    # Allow target feed domain or ATS domains
+    if parent_domain and parent_domain in netloc:
+        return True
+    if any(ats in netloc for ats in ["greenhouse.io", "ashbyhq.com", "lever.co", "workable.com"]):
+        return True
+
+    return False
+
+def record_unreached_depth_report(source_name, start_url, path_history):
+    """Logs paths that reached Depth 5 without finding valid job/position links."""
+    header = "# Deep Crawl Unreached Path Report\n\n"
+    if not os.path.exists(UNREACHED_DEPTH_FILE):
+        with open(UNREACHED_DEPTH_FILE, "w", encoding="utf-8") as f:
+            f.write(header)
+    
+    path_str = " -> ".join(path_history)
+    entry = f"### [Max Depth 5 Reached] Source: {source_name}\n- **Start URL**: {start_url}\n- **Path Traversed**: {path_str}\n- **Timestamp**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    
+    with open(UNREACHED_DEPTH_FILE, "a", encoding="utf-8") as f:
+        f.write(entry)
+    
+    logger.warning(f"[Max Depth Exceeded (5 Levels)] {source_name}: {path_str}")
+
+def fetch_web_source(source_info, max_depth=5, max_pages=60):
+    """
+    Executes a 5-level deep BFS crawler across job board feeds & marketplaces.
+    Extracts verified job links, follows company/job subpages up to depth 5,
+    and logs unreached paths if depth 5 is reached without finding job links.
+    """
     name = source_info["name"]
-    url = source_info["url"]
+    start_url = source_info["url"]
     stype = source_info["type"]
     jobs = []
+    
+    parsed_start = urllib.parse.urlparse(start_url)
+    parent_domain = parsed_start.netloc.lower()
 
-    try:
-        r = curl_requests.get(url, impersonate="chrome", timeout=10)
-        if r.status_code in (200, 301, 302):
+    # BFS Queue: tuples of (current_url, depth, path_history)
+    queue = [(start_url, 0, [start_url])]
+    visited_urls = set()
+    pages_crawled = 0
+
+    while queue and pages_crawled < max_pages:
+        current_url, depth, path_history = queue.pop(0)
+
+        if current_url in visited_urls:
+            continue
+        visited_urls.add(current_url)
+        pages_crawled += 1
+
+        try:
+            r = curl_requests.get(current_url, impersonate="chrome", timeout=8)
+            if r.status_code not in (200, 301, 302):
+                continue
+
             soup = BeautifulSoup(r.text, "html.parser")
             links = soup.find_all("a", href=True)
-            seen_urls = set()
+            found_job_at_this_level = False
+
             for link in links:
                 t_text = sanitize_text(link.get_text())
                 href = link["href"]
                 if not href.startswith("http"):
-                    href = requests.compat.urljoin(url, href)
-                
-                if href in seen_urls:
-                    continue
+                    href = requests.compat.urljoin(current_url, href)
 
+                # Check if link is a verified job posting
                 details = extract_job_details_from_link(href, t_text, name)
                 if details:
-                    seen_urls.add(href)
-                    jobs.append({
-                        "company": details["company"],
-                        "title": details["title"],
-                        "location": details["location"],
-                        "url": details["url"],
-                        "source": f"{name} ({stype})",
-                        "comp": "Unspecified",
-                        "domain": f"{stype} Feed"
-                    })
-    except Exception as e:
-        record_log(name, url, "Error", str(e))
+                    found_job_at_this_level = True
+                    if not any(j["url"] == details["url"] for j in jobs):
+                        jobs.append({
+                            "company": details["company"],
+                            "title": details["title"],
+                            "location": details["location"],
+                            "url": details["url"],
+                            "source": f"{name} ({stype})",
+                            "comp": "Unspecified",
+                            "domain": f"{stype} Deep Feed"
+                        })
+                else:
+                    # Not a job page link -> check if valid subpage link to traverse further
+                    if depth < max_depth and is_valid_subpage_link(href, parent_domain):
+                        if href not in visited_urls and href not in [q[0] for q in queue]:
+                            queue.append((href, depth + 1, path_history + [href]))
+
+            if depth == max_depth and not found_job_at_this_level:
+                record_unreached_depth_report(name, start_url, path_history)
+
+        except Exception as e:
+            logger.debug(f"Error deep crawling {current_url} (depth {depth}): {e}")
 
     return jobs
 
