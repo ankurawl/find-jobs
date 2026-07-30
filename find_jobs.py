@@ -521,32 +521,34 @@ def scrape_jobs_directly_from_company_website(company, direct_keywords):
         website.rstrip("/") + "/join-us"
     ]
 
-    kw_list = [kw.lower() for kw in direct_keywords] if direct_keywords else ['product manager', 'engineer', 'developer', 'manager', 'lead']
-
     for c_url in candidate_career_urls:
         try:
             r = curl_requests.get(c_url, impersonate="chrome", timeout=8)
             if r.status_code == 200:
-                record_log(f"{c_name} Website", c_url, "Success (200)", "Direct career website page scraped successfully")
                 soup = BeautifulSoup(r.text, "html.parser")
                 links = soup.find_all("a", href=True)
+                kw_list = [kw.lower() for kw in direct_keywords] if direct_keywords else ['product manager', 'engineer', 'developer', 'manager', 'lead', 'principal', 'staff']
                 for link in links:
                     t_text = sanitize_text(link.get_text())
                     href = link["href"]
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(c_url, href)
-                    
+
                     if any(kw in t_text.lower() for kw in kw_list):
-                        found_jobs.append({
-                            "company": c_name,
-                            "title": t_text,
-                            "location": "US (Remote / On-site)",
-                            "url": href,
-                            "source": f"{c_name} Direct Career Site",
-                            "comp": "$200K - $350K + Equity",
-                            "domain": f"Direct Website Career Page ({c_name})"
-                        })
+                        details = extract_job_details_from_link(href, t_text, c_name)
+                        if details and details.get("title") and len(details["title"]) >= 4:
+                            if not any(j["url"] == details["url"] for j in found_jobs):
+                                found_jobs.append({
+                                    "company": c_name,
+                                    "title": details["title"],
+                                    "location": details.get("location") or "US (Remote / On-site)",
+                                    "url": details["url"],
+                                    "source": f"{c_name} Direct Career Site",
+                                    "comp": "$200K - $350K + Equity",
+                                    "domain": f"Direct Website Career Page ({c_name})"
+                                })
                 if found_jobs:
+                    record_log(f"{c_name} Website", c_url, "Success (200)", f"Discovered {len(found_jobs)} jobs via direct career site")
                     break
         except Exception as e:
             logger.debug(f"Error scraping career site {c_url}: {e}")
@@ -556,10 +558,54 @@ def scrape_jobs_directly_from_company_website(company, direct_keywords):
 def web_search_careers_page_fallback(company):
     """Probe 3: Web search for company careers/jobs page if ATS and direct site probing yield 0 jobs."""
     c_name = company["name"]
-    found_jobs = []
-    search_results = search_ddg_html(f"{c_name} careers jobs ashby OR greenhouse OR lever")
+    c_slug = company.get("slug", "")
+    c_website = company.get("website", "")
+    c_domain = ""
+    if c_website:
+        parsed_web = urllib.parse.urlparse(c_website)
+        c_domain = parsed_web.netloc.lower().replace("www.", "")
 
-    for url in search_results[:3]:
+    found_jobs = []
+    search_results = search_ddg_html(f"{c_name} careers jobs ashby OR greenhouse OR lever OR workday")
+
+    KNOWN_ATS_DOMAINS = [
+        "greenhouse.io", "ashbyhq.com", "lever.co", "workday.com",
+        "myworkdayjobs.com", "smartrecruiters.com", "icims.com",
+        "bamboohr.com", "rippling.com"
+    ]
+
+    c_name_norm = normalize_text(c_name)
+    c_slug_norm = normalize_text(c_slug)
+    c_domain_norm = normalize_text(c_domain)
+
+    for url in search_results[:5]:
+        url_lower = url.lower()
+        parsed_res = urllib.parse.urlparse(url)
+        res_netloc = parsed_res.netloc.lower().replace("www.", "")
+
+        # Target search result URL MUST belong to the target company domain or a recognized ATS domain
+        is_company_domain = c_domain and (c_domain in res_netloc or res_netloc in c_domain)
+        is_ats_domain = any(ats in res_netloc for ats in KNOWN_ATS_DOMAINS)
+
+        if not (is_company_domain or is_ats_domain):
+            continue
+
+        if is_ats_domain and not is_company_domain:
+            ats_match = re.search(r'(?:greenhouse\.io|ashbyhq\.com|lever\.co|myworkdayjobs\.com|workday\.com)/([^/\?]+)', url, re.IGNORECASE)
+            if ats_match:
+                ats_slug = normalize_text(ats_match.group(1))
+                matches_company = (
+                    (ats_slug and ats_slug in c_name_norm) or
+                    (c_name_norm and c_name_norm in ats_slug) or
+                    (c_slug_norm and (ats_slug in c_slug_norm or c_slug_norm in ats_slug)) or
+                    (c_domain_norm and (ats_slug in c_domain_norm or c_domain_norm in ats_slug))
+                )
+                if not matches_company:
+                    continue
+
+        if any(pat in url_lower for pat in ["/blog", "/news", "/press", "/article", "/post", "/event", "/podcast", "/story"]):
+            continue
+
         try:
             r = curl_requests.get(url, impersonate="chrome", timeout=8)
             if r.status_code == 200:
@@ -570,16 +616,19 @@ def web_search_careers_page_fallback(company):
                     href = link["href"]
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(url, href)
-                    if len(t_text) >= 8 and any(kw in t_text.lower() for kw in ['product manager', 'lead', 'senior', 'principal', 'staff', 'manager']):
-                        found_jobs.append({
-                            "company": c_name,
-                            "title": t_text,
-                            "location": "US (Remote / On-site)",
-                            "url": href,
-                            "source": f"{c_name} Web Search Careers Link",
-                            "comp": "$200K - $350K + Equity",
-                            "domain": f"Web Search Discovery ({c_name})"
-                        })
+
+                    details = extract_job_details_from_link(href, t_text, c_name)
+                    if details and details.get("title") and len(details["title"]) >= 4:
+                        if not any(j["url"] == details["url"] for j in found_jobs):
+                            found_jobs.append({
+                                "company": c_name,
+                                "title": details["title"],
+                                "location": details.get("location") or "US (Remote / On-site)",
+                                "url": details["url"],
+                                "source": f"{c_name} Web Search Careers Link",
+                                "comp": "$200K - $350K + Equity",
+                                "domain": f"Web Search Discovery ({c_name})"
+                            })
                 if found_jobs:
                     record_log(f"{c_name} Web Search", url, "Success (200)", f"Discovered {len(found_jobs)} jobs via web search fallback")
                     break
@@ -601,6 +650,26 @@ def extract_job_details_from_link(href, text, source_name):
     if not text_clean or len(text_clean) < 3:
         return None
 
+    parsed_url = urllib.parse.urlparse(href)
+    path_segments = [p for p in parsed_url.path.rstrip("/").split("/") if p]
+
+    # Root domain URLs without paths (e.g. https://jazzhr.com) are not job postings
+    if not path_segments:
+        return None
+
+    # Single top-level generic marketing/corporate paths are not job postings
+    generic_marketing_paths = {
+        "company", "about", "features", "pricing", "solutions", "contact",
+        "login", "signup", "terms", "privacy", "security", "product", "platform",
+        "home", "overview", "team", "press", "events", "resources", "blog"
+    }
+    if len(path_segments) == 1 and path_segments[0].lower() in generic_marketing_paths:
+        return None
+
+    # Ignore PDF documents (e.g. EEOC posters, legal notices, guidelines)
+    if url_lower.endswith(".pdf") or ".pdf?" in url_lower:
+        return None
+
     # Ignore Builtin category/listing pages or awards pages that are not individual job postings
     if "builtin.com" in url_lower:
         if re.search(r'builtin\.com/jobs(?:/|\?|$)', url_lower) or any(p in url_lower for p in ["/awards", "/companies", "/salaries", "/tech-"]):
@@ -611,11 +680,13 @@ def extract_job_details_from_link(href, text, source_name):
         "/categories", "/investors", "/stages", "/industries", "/locations",
         "/faq", "/salaries", "/companies", "/hire", "/privacy", "/terms", "/legal",
         "/login", "/signup", "tally.so", "/tech-topics", "/tech-hubs",
-        "/tech-dictionary", "/about", "/news", "/category/", "/blogs/", "/post/",
-        "/demo", "/pricing", "/security", "/roi", "/events", "/webinars",
+        "/tech-dictionary", "/about", "/news", "/category/", "/blogs", "/blog",
+        "/post", "/posts", "/article", "/articles", "/press", "/story", "/stories",
+        "/resource", "/resources", "/webinar", "/webinars", "/event", "/events",
+        "/podcast", "/podcasts", "/demo", "/pricing", "/security", "/roi",
         "/customer-stories", "/glossary", "/onboarding", "/integrations",
         "/content-topic/", "/compare", "/platform", "/enterprise", "/support",
-        "/guidance", "/resources", "/talent-makers", "/latest-features", "/sponsor",
+        "/guidance", "/talent-makers", "/latest-features", "/sponsor", ".pdf",
         "learn.greenhouse.io", "support.greenhouse.io", "developers.greenhouse.io",
         "my.greenhouse.com", "app.greenhouse.io", "techcrunch.com", "finsmes.com",
         "upstartsmedia.com", "fundraiseinsider.com", "reuters.com", "citybiz.co",
@@ -643,22 +714,34 @@ def extract_job_details_from_link(href, text, source_name):
         "early-stage business", "scaling company", "modern enterprise", "job seekers",
         "how we compare", "return on your hiring", "your partner in success", "guidance",
         "source", "link", "see all investors", "categories", "explore", "sponsor", "investors",
-        "best places to work", "explore companies hiring", "see all remote tech jobs"
+        "best places to work", "explore companies hiring", "see all remote tech jobs",
+        "job search", "search jobs", "search all jobs", "explore jobs", "open jobs",
+        "open roles", "view jobs", "view open positions", "career opportunities",
+        "search positions", "job openings", "current openings", "workday", "ashby",
+        "greenhouse", "lever", "work", "life", "today", "carrier deals", "eeo rights",
+        "know your rights", "fair chance"
     ]
-    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at", "request a demo", "skip to content", "see all investors", "best places to work", "tech jobs & startup jobs"]):
+    ignored_substring_terms = [
+        "join our talent pool", "explore 100k+", "what's it like to work at", "request a demo",
+        "skip to content", "see all investors", "best places to work", "tech jobs & startup jobs",
+        "know your rights", "work at", "life at", "carrier deals", "eeo rights", "fair chance",
+        "work at apple", "life at apple", "job search", "search jobs", "explore companies"
+    ]
+    if text_lower in ignored_text_terms or any(term in text_lower for term in ignored_substring_terms):
         return None
 
     company = ""
     title = text_clean
     location = "US / Unspecified"
 
-    # Known ATS root domain check: if URL is an ATS domain without a company slug & job ID, discard it
-    if any(host in url_lower for host in ["greenhouse.io", "ashbyhq.com", "lever.co"]):
+    # Known ATS root domain check: if URL is an ATS domain without a company slug & valid job ID, discard it
+    if any(host in url_lower for host in ["greenhouse.io", "ashbyhq.com", "lever.co", "myworkdayjobs.com", "workday.com"]):
         is_valid_ats_job = (
-            re.search(r'greenhouse\.io/([^/]+)/jobs/', href, re.IGNORECASE) or
+            re.search(r'greenhouse\.io/([^/]+)/jobs/\d+', href, re.IGNORECASE) or
             re.search(r'greenhouse\.io/embed/job_board\?for=([^&]+)', href, re.IGNORECASE) or
-            re.search(r'ashbyhq\.com/([^/]+)/[a-f0-9-]+', href, re.IGNORECASE) or
-            re.search(r'lever\.co/([^/]+)/[a-f0-9-]+', href, re.IGNORECASE)
+            re.search(r'ashbyhq\.com/([^/]+)/[a-f0-9]{8}-', href, re.IGNORECASE) or
+            (re.search(r'lever\.co/([^/]+)/[a-f0-9-]{15,}', href, re.IGNORECASE) and "/blog" not in url_lower) or
+            re.search(r'(?:myworkdayjobs\.com|workday\.com)/.*?/(?:job|job-detail)/', href, re.IGNORECASE)
         )
         if not is_valid_ats_job:
             return None
