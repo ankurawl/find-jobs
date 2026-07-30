@@ -588,6 +588,154 @@ def web_search_careers_page_fallback(company):
 
     return found_jobs
 
+def extract_job_details_from_link(href, text, source_name):
+    """
+    Parses company name, clean job title, and location from target URL and link text.
+    Handles ATS links (Greenhouse, Ashby, Lever), structured text (Title · Company · Location),
+    and filters out non-job navigation links.
+    """
+    url_lower = href.lower()
+    text_clean = sanitize_text(text)
+    text_lower = text_clean.lower()
+
+    if not text_clean or len(text_clean) < 3:
+        return None
+
+    # 1. Non-job URL blacklist
+    ignored_url_patterns = [
+        "/categories/", "/investors/", "/stages/", "/industries/", "/locations/",
+        "/faq/", "/salaries", "/companies", "/hire", "/privacy", "/terms",
+        "/login", "/signup", "tally.so", "/tech-topics", "/tech-hubs",
+        "/tech-dictionary", "/about", "/news", "/category/", "/blogs/", "/post/"
+    ]
+    if any(pat in url_lower for pat in ignored_url_patterns):
+        return None
+
+    # 2. Non-job link text blacklist
+    ignored_text_terms = [
+        "home", "about", "careers", "privacy", "terms", "jobs", "login", "sign up",
+        "learn more", "see all", "bootstrapped", "pre-seed", "series a", "series b",
+        "series c", "series d", "series e", "view all jobs", "explore companies",
+        "tech dictionary", "for employers", "company reviews", "find salaries",
+        "cookie policy", "contact us", "help center", "all tech jobs", "tech companies",
+        "companies hiring remotely", "fully remote companies", "tech + startup salaries",
+        "tech news", "tech hubs", "explore employer solutions", "explore 100k+ companies",
+        "articles", "employers / post job", "join our talent pool", "beta"
+    ]
+    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at"]):
+        return None
+
+    company = ""
+    title = text_clean
+    location = "US / Unspecified"
+
+    # Slug mapping for clean company names
+    SLUG_NAME_OVERRIDES = {
+        "scaleai": "Scale AI",
+        "openai": "OpenAI",
+        "anysphere": "Anysphere (Cursor)",
+        "tailscale": "Tailscale",
+        "mixpanel": "Mixpanel",
+        "harvey": "Harvey",
+        "anthropic": "Anthropic"
+    }
+
+    # A. Extract Company from ATS URL structure if present
+    # Greenhouse: job-boards.greenhouse.io/<company_slug>/jobs/<id>
+    gh_match = re.search(r'greenhouse\.io/([^/]+)/jobs/', href, re.IGNORECASE)
+    if not gh_match:
+        gh_match = re.search(r'greenhouse\.io/embed/job_board\?for=([^&]+)', href, re.IGNORECASE)
+    if gh_match:
+        slug = gh_match.group(1).lower()
+        company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
+
+    # Ashby: jobs.ashbyhq.com/<company_slug>/<id>
+    if not company:
+        ashby_match = re.search(r'ashbyhq\.com/([^/]+)/', href, re.IGNORECASE)
+        if ashby_match:
+            slug = ashby_match.group(1).lower()
+            company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
+
+    # Lever: jobs.lever.co/<company_slug>/<id>
+    if not company:
+        lever_match = re.search(r'lever\.co/([^/]+)/', href, re.IGNORECASE)
+        if lever_match:
+            slug = lever_match.group(1).lower()
+            company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
+
+    # Built In job URLs: builtin.com/company/<slug>/jobs/ or builtin.com/job/...
+    if not company:
+        bi_match = re.search(r'builtin\.com/company/([^/]+)/', href, re.IGNORECASE)
+        if bi_match:
+            slug = bi_match.group(1).lower()
+            company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
+
+    # B. Parse structured link text (e.g. "TitleCompany · Location · Date")
+    parts = [p.strip() for p in text_clean.split("·") if p.strip()]
+    if len(parts) >= 2:
+        if parts[-1].lower().startswith("posted on"):
+            parts.pop()
+        
+        if len(parts) >= 2 and any(loc_kw in parts[-1].lower() for loc_kw in ["remote", "hybrid", "on-site", "united states", "canada", "sf", "ny", "ca", "tx", "wa", "ma", "co"]):
+            location = parts[-1]
+            title_part = " · ".join(parts[:-1])
+        else:
+            title_part = parts[0]
+
+        if company:
+            comp_pattern = re.escape(company)
+            m_comp = re.search(r'(.*?)(?:\s*at\s+|\s+@\s+|\s*-\s*|\s*\|\s*|(?<=[a-z0-9\)\>\]]))' + comp_pattern + r'$', title_part, re.IGNORECASE)
+            if m_comp and m_comp.group(1).strip():
+                title = m_comp.group(1).strip()
+            elif title_part.lower().endswith(company.lower()):
+                title = title_part[:-len(company)].strip()
+            else:
+                title = title_part
+        else:
+            for delim in [" at ", " @ ", " - ", " | "]:
+                if delim in title_part:
+                    t_sub, c_sub = title_part.rsplit(delim, 1)
+                    if len(c_sub.strip()) >= 2 and len(t_sub.strip()) >= 3:
+                        title = t_sub.strip()
+                        company = c_sub.strip().title()
+                        break
+            if not company:
+                title = title_part
+    else:
+        if company:
+            if title.lower().endswith(company.lower()):
+                title = title[:-len(company)].strip()
+        else:
+            for delim in [" at ", " @ ", " - ", " | "]:
+                if delim in text_clean:
+                    t_sub, c_sub = text_clean.rsplit(delim, 1)
+                    if len(c_sub.strip()) >= 2 and len(t_sub.strip()) >= 3:
+                        title = t_sub.strip()
+                        company = c_sub.strip().title()
+                        break
+
+    title = re.sub(r'\s+', ' ', title).strip(" -|·")
+
+    if not company:
+        parsed_url = urllib.parse.urlparse(href)
+        if parsed_url.netloc and source_name.lower() not in parsed_url.netloc.lower():
+            host_parts = parsed_url.netloc.split(".")
+            if len(host_parts) >= 2:
+                company = host_parts[-2].capitalize()
+    
+    if not company:
+        company = f"Company via {source_name}"
+
+    if len(title) < 4:
+        return None
+
+    return {
+        "company": company,
+        "title": title,
+        "location": location,
+        "url": href
+    }
+
 def fetch_web_source(source_info):
     name = source_info["name"]
     url = source_info["url"]
@@ -599,25 +747,28 @@ def fetch_web_source(source_info):
         if r.status_code in (200, 301, 302):
             soup = BeautifulSoup(r.text, "html.parser")
             links = soup.find_all("a", href=True)
-            seen_titles = set()
+            seen_urls = set()
             for link in links:
                 t_text = sanitize_text(link.get_text())
                 href = link["href"]
                 if not href.startswith("http"):
                     href = requests.compat.urljoin(url, href)
                 
-                if len(t_text) >= 8 and t_text.lower() not in ("home", "about", "careers", "privacy", "terms", "jobs", "login", "sign up", "learn more"):
-                    if t_text not in seen_titles:
-                        seen_titles.add(t_text)
-                        jobs.append({
-                            "company": name,
-                            "title": t_text,
-                            "location": "US / Unspecified",
-                            "url": href,
-                            "source": f"{name} ({stype})",
-                            "comp": "Unspecified",
-                            "domain": f"{stype} Feed"
-                        })
+                if href in seen_urls:
+                    continue
+
+                details = extract_job_details_from_link(href, t_text, name)
+                if details:
+                    seen_urls.add(href)
+                    jobs.append({
+                        "company": details["company"],
+                        "title": details["title"],
+                        "location": details["location"],
+                        "url": details["url"],
+                        "source": f"{name} ({stype})",
+                        "comp": "Unspecified",
+                        "domain": f"{stype} Feed"
+                    })
     except Exception as e:
         record_log(name, url, "Error", str(e))
 
@@ -880,7 +1031,7 @@ def collect_all_raw_jobs(config, max_new_companies=100):
 
     # 4. Web sources discovery feeds from config.json
     for src in config.get("job_sources", []):
-        if src.get("type") in ("job_board", "curated_jobs", "curated_pm_jobs", "tech_news"):
+        if src.get("type") in ("job_board", "curated_jobs", "curated_pm_jobs", "tech_news", "ats_board", "funding_and_jobs"):
             jobs = fetch_web_source(src)
             if jobs:
                 logger.info(f"Discovered {len(jobs)} raw jobs from web feed '{src['name']}'")
