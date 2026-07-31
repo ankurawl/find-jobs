@@ -17,11 +17,12 @@ Features:
 
 import json
 import logging
+import email.utils
 import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 import requests
 from bs4 import BeautifulSoup
@@ -346,32 +347,114 @@ def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website,
         return True, current_session_count
     return False, current_session_count
 
-def extract_funding_news_and_update_targets(news_sources, max_new_companies=100):
-    logger.info("Extracting funded startup entity leads from news sources...")
+def parse_article_date(date_str):
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    try:
+        if "T" in date_str:
+            return datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        parsed_tuple = email.utils.parsedate(date_str)
+        if parsed_tuple:
+            return datetime(*parsed_tuple[:6])
+    except Exception:
+        pass
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            pass
+    rel_match = re.search(r'(\d+)\s+(day|hour|week|month)s?\s+ago', date_str, re.I)
+    if rel_match:
+        num = int(rel_match.group(1))
+        unit = rel_match.group(2).lower()
+        if unit == "hour":
+            return datetime.now() - timedelta(hours=num)
+        elif unit == "day":
+            return datetime.now() - timedelta(days=num)
+        elif unit == "week":
+            return datetime.now() - timedelta(weeks=num)
+        elif unit == "month":
+            return datetime.now() - timedelta(days=num * 30)
+    return None
+
+def build_news_page_url(base_url, page_num):
+    if page_num == 1:
+        return base_url
+    if "?" in base_url:
+        return f"{base_url}&page={page_num}"
+    clean_base = base_url.rstrip("/")
+    return f"{clean_base}/page/{page_num}/"
+
+def extract_funding_news_and_update_targets(news_sources, max_new_companies=100, max_pages_per_source=5, filter_criteria=None):
+    logger.info("Extracting funded startup entity leads from news sources (multi-page)...")
+    if filter_criteria is None:
+        filter_criteria = {}
+
+    lookback_months = filter_criteria.get("funding_lookback_months", 6)
+    cutoff_date = datetime.now() - timedelta(days=int(lookback_months * 30.5))
+
+    funding_verbs = r'(?:raises|raised|secures|secured|snags|snagged|bags|bagged|nabs|nabbed|closes|closed|lands|landed|locks in|locked in|pulls in|pulled in|hauls in|hauled in|scoops up|scooped up|picks up|picked up|fetches|fetched|attracts|attracted|obtains|obtained|banks|banked|gets|got|hits)'
     funding_patterns = [
-        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,25})\s+(?:raises|raised|secures|secured|snags|snagged|bags|bagged|nabs|nabbed|closes|closed|lands|landed)\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?(?:\s+(?:Series\s+[A-E]|growth|funding|valuation))?)', re.IGNORECASE),
-        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,25})\s+hits\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?\s*valuation)', re.IGNORECASE)
+        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,30})\s+' + funding_verbs + r'\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?(?:\s+(?:Series\s+[A-F]|growth|funding|valuation|seed))?)', re.IGNORECASE),
+        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,30})\s+hits\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?\s*valuation)', re.IGNORECASE)
     ]
 
     discovered_companies = []
     session_count = 0
+    seen_hrefs = set()
 
     for src in news_sources:
         if session_count >= max_new_companies:
             break
         s_name = src["name"]
         s_url = src["url"]
-        try:
-            r = curl_requests.get(s_url, impersonate="chrome", timeout=10)
-            if r.status_code == 200:
-                record_log(s_name, s_url, "Success (200)", f"Fetched news feed successfully ({len(r.text)} bytes)")
+
+        for page in range(1, max_pages_per_source + 1):
+            if session_count >= max_new_companies:
+                break
+
+            page_url = build_news_page_url(s_url, page)
+            try:
+                r = curl_requests.get(page_url, impersonate="chrome", timeout=10)
+                if r.status_code != 200:
+                    # If /page/2/ returned 404, fallback to ?page=2
+                    if page > 1 and "/page/" in page_url:
+                        alt_url = f"{s_url.rstrip('/')}?page={page}"
+                        r = curl_requests.get(alt_url, impersonate="chrome", timeout=10)
+                        if r.status_code == 200:
+                            page_url = alt_url
+
+                    if r.status_code != 200:
+                        logger.info(f"{s_name}: Page {page} returned status {r.status_code}, stopping pagination for this source.")
+                        break
+
+                record_log(s_name, page_url, "Success (200)", f"Fetched news feed page {page} ({len(r.text)} bytes)")
                 soup = BeautifulSoup(r.text, "html.parser")
                 
-                for a in soup.find_all('a', href=True):
+                out_of_date_count = 0
+                valid_items_count = 0
+
+                anchors = soup.find_all('a', href=True)
+                for a in anchors:
                     txt = sanitize_text(a.get_text())
                     href = a['href']
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(s_url, href)
+
+                    if href in seen_hrefs:
+                        continue
+
+                    parent = a.parent
+                    time_tag = (parent.find('time') if parent else None) or (parent.parent.find('time') if parent and parent.parent else None)
+                    if time_tag:
+                        date_str = time_tag.get('datetime') or time_tag.get_text()
+                        item_date = parse_article_date(date_str)
+                        if item_date and item_date < cutoff_date:
+                            out_of_date_count += 1
+                            continue
+
+                    seen_hrefs.add(href)
 
                     if len(txt) > 15:
                         for pat in funding_patterns:
@@ -390,10 +473,15 @@ def extract_funding_news_and_update_targets(news_sources, max_new_companies=100)
                                     )
                                     if added:
                                         discovered_companies.append(comp_clean)
-            else:
-                record_log(s_name, s_url, f"HTTP Error ({r.status_code})", "Non-200 response from news source")
-        except Exception as e:
-            record_log(s_name, s_url, "Error / Failure", str(e))
+                                        valid_items_count += 1
+
+                if out_of_date_count > 5 and valid_items_count == 0:
+                    logger.info(f"{s_name}: Found {out_of_date_count} items older than lookback cutoff date ({lookback_months} months), stopping pagination.")
+                    break
+
+            except Exception as e:
+                record_log(s_name, page_url, "Error / Failure", str(e))
+                break
 
     return discovered_companies
 
@@ -1117,9 +1205,15 @@ def collect_all_raw_jobs(config, max_new_companies=100):
     news_sources = config.get("funding_news_sources", [])
     filter_criteria = config.get("filter_criteria", {})
     direct_keywords = filter_criteria.get("direct_career_site_keywords", [])
+    max_pages = config.get("max_pages_per_source", 5)
 
     # 1. Scrape funding news, resolve domains, and update target companies in Pipeline.md (capped at max_new_companies)
-    extract_funding_news_and_update_targets(news_sources, max_new_companies=max_new_companies)
+    extract_funding_news_and_update_targets(
+        news_sources,
+        max_new_companies=max_new_companies,
+        max_pages_per_source=max_pages,
+        filter_criteria=filter_criteria
+    )
 
     # 2. Parse target companies from Pipeline.md
     target_companies = parse_target_companies_from_pipeline()
