@@ -465,7 +465,7 @@ def extract_funding_news_and_update_targets(news_sources, max_new_companies=100,
                     if href in seen_hrefs:
                         continue
 
-                    parent = a.parent
+                    parent = item.parent
                     time_tag = (parent.find('time') if parent else None) or (parent.parent.find('time') if parent and parent.parent else None)
                     if time_tag:
                         date_str = time_tag.get('datetime') or time_tag.get_text()
