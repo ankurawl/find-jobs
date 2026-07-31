@@ -189,25 +189,46 @@ AGGREGATOR_DOMAINS = {
     "linkedin.com", "twitter.com", "x.com", "facebook.com", "youtube.com",
     "github.com", "wikipedia.org", "medium.com", "news.ycombinator.com",
     "bloomberg.com", "reuters.com", "wsj.com", "forbes.com",
-    "businessinsider.com", "prnewswire.com", "businesswire.com", "globenewswire.com"
+    "businessinsider.com", "prnewswire.com", "businesswire.com", "globenewswire.com",
+    "crunchboard.com", "strictlyvc.com", "cision.com", "domguzman.com",
+    "doubleclick.net", "googleadservices.com", "googlesyndication.com",
+    "wordpress.org", "schema.org", "w3.org", "apple.com", "google.com",
+    "microsoft.com", "amazon.com", "cloudflare.com", "fastly.com", "akamai.com",
+    "zendesk.com", "hubspot.com", "intercom.io", "salesforce.com", "marketo.com", "drift.com"
 }
-
-NOISE_PREFIXES = [
-    r'^(?:As|The|AI|New|Startup|Tech|How|Why|What|After|With|About|For|In|On)\s+',
-    r'^(?:bot-detection startup|synthetic-user startup|edtech platform|training platform|battery storage startup|cloud security startup|cybersecurity startup|fintech startup|healthtech startup|medtech startup|biotech startup|stealth startup)\s+',
-    r'^(?:ery storage startup|ning platform|form)\s+'
-]
 
 def clean_company_name(name):
     if not name:
         return ""
     clean = name.strip()
-    for pat in NOISE_PREFIXES:
-        clean = re.sub(pat, '', clean, flags=re.IGNORECASE).strip()
-    clean = re.sub(r'^[^\w]+', '', clean)
-    return clean
+    
+    # Take last clause if comma separated
+    if "," in clean:
+        clean = clean.split(",")[-1].strip()
+    
+    # Strip common leading industry descriptors and noise words
+    descriptors = [
+        r'\b(?:synthetic-user|bot-detection|bot detection|battery storage|cloud security|cybersecurity|edtech|healthtech|medtech|biotech|fintech|stealth|enterprise saas training|training|logistics|robotics|climate|venture)\b',
+        r'\b(?:startup|startups|platform|platforms|company|firm|provider|developer|builder|app|tool|service|solution|system)\b',
+        r'\b(?:as|the|a|an|new|how|why|what|after|with|about|for|in|on)\b'
+    ]
+    
+    for desc in descriptors:
+        clean = re.sub(desc, '', clean, flags=re.IGNORECASE).strip()
+    
+    # Clean leading punctuation
+    clean = re.sub(r'^[^\w]+', '', clean).strip()
+    
+    # Extract trailing proper noun / title case phrase
+    m = re.search(r'([A-Z][A-Za-z0-9\.\-\&]+(?:\s+[A-Z0-9][A-Za-z0-9\.\-\&]+)*)$', clean)
+    if m:
+        return m.group(1).strip()
+        
+    return clean.strip()
 
 def is_aggregator_domain(url):
+    if not url:
+        return True
     try:
         netloc = urllib.parse.urlparse(url).netloc.lower()
         if netloc.startswith("www."):
@@ -260,26 +281,18 @@ def search_ddg_html(query):
     return list(dict.fromkeys(urls))
 
 def verify_and_select_best_domain(candidate_urls, company_name, news_context):
-    """Scrapes candidate landing pages and scores against news context to select official domain."""
-    if not candidate_urls:
-        slug = company_name.lower().replace(" ", "").replace(".", "")
-        return f"https://{slug}.com"
+    """
+    Empirically verifies candidate website landing pages by probing HTTP status, page title,
+    and meta description to confirm the official domain for company_name.
+    """
+    c_words = [w.lower() for w in re.findall(r'\w+', company_name) if len(w) >= 3]
+    if not c_words:
+        c_words = [company_name.lower().strip()]
 
-    c_name_norm = company_name.lower().strip()
-    c_words = set(re.findall(r'\w+', c_name_norm))
-    ignore_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "raises", "raised", "funding", "series", "million", "billion"}
-    ctx_words = set(re.findall(r'\w+', news_context.lower())) - ignore_words
-
-    best_url = candidate_urls[0]
-    best_score = -1
-
-    for url in candidate_urls[:3]:
-        score = 0
+    for url in candidate_urls:
+        if is_aggregator_domain(url):
+            continue
         try:
-            domain = urllib.parse.urlparse(url).netloc.lower()
-            if any(w in domain for w in c_words if len(w) >= 3):
-                score += 10
-
             r = curl_requests.get(url, impersonate="chrome", timeout=6)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -289,31 +302,46 @@ def verify_and_select_best_domain(candidate_urls, company_name, news_context):
                 if meta_tag:
                     meta_desc = (meta_tag.get("content") or "").lower()
 
-                combined_text = title + " " + meta_desc
-                if any(w in combined_text for w in c_words if len(w) >= 3):
-                    score += 15
-
-                overlap = len(ctx_words.intersection(set(re.findall(r'\w+', combined_text))))
-                score += overlap * 2
-
-                if score > best_score:
-                    best_score = score
-                    best_url = url
+                combined = title + " " + meta_desc
+                # Verify company name or primary word exists in landing page title or meta description
+                if any(w in combined for w in c_words):
+                    parsed_res = urllib.parse.urlparse(r.url)
+                    root_domain = f"{parsed_res.scheme}://{parsed_res.netloc}"
+                    return root_domain
         except Exception:
             pass
 
-    return best_url.rstrip("/")
+    # Fallback to first non-aggregator candidate root domain if landing page content is JS rendered
+    for url in candidate_urls:
+        if not is_aggregator_domain(url):
+            parsed_res = urllib.parse.urlparse(url)
+            return f"{parsed_res.scheme}://{parsed_res.netloc}"
+
+    c_slug = company_name.lower().replace(" ", "").replace(".", "")
+    return f"https://{c_slug}.com"
 
 def resolve_company_domain(company_name, news_context, article_url=None):
-    """3-stage domain resolution: 1. Article links, 2. Web search fallback, 3. Context verification."""
+    """
+    3-Stage Domain Resolution:
+    Stage 1: Inspect outbound links from the news article.
+    Stage 2: Targeted web search with rich company & news context.
+    Stage 3: Scrape & verify candidate landing page title/meta description before accepting.
+    """
     candidates = []
     if article_url:
         candidates = extract_article_links(article_url)
-    if not candidates:
-        candidates = search_ddg_html(f"{company_name} official website startup")
-    return verify_and_select_best_domain(candidates, company_name, news_context)
+    
+    # Stage 2: Perform targeted DDG search with rich company and context keywords
+    clean_ctx = re.sub(r'[^\w\s]', ' ', news_context)
+    ctx_keywords = " ".join([w for w in clean_ctx.split() if len(w) >= 4 and w.lower() not in ["funding", "news", "raises", "raised", "series", "million", "billion"]][:4])
+    
+    search_query = f"{company_name} {ctx_keywords} official website"
+    ddg_candidates = search_ddg_html(search_query)
+    
+    all_candidates = list(dict.fromkeys(candidates + ddg_candidates))
+    return verify_and_select_best_domain(all_candidates, company_name, news_context)
 
-def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website, ats_info="Auto", article_url=None, max_new_companies=100, current_session_count=0):
+def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website, ats_info="N/A", article_url=None, max_new_companies=100, current_session_count=0):
     if current_session_count >= max_new_companies:
         logger.warning(f"Reached max session limit of {max_new_companies} new companies added to Pipeline.md.")
         return False, current_session_count
@@ -327,12 +355,18 @@ def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website,
         return False, current_session_count
 
     today_str = datetime.now().strftime("%b %d, %Y")
-    notes = f"Added via News Sync ({reason})"
+    
+    # Format Source / Reason with hyperlinked news article URL if present
     if article_url:
-        notes += f" | Article: {article_url}"
-    notes += f" - {today_str}"
+        source_reason = f"[{reason}]({article_url})"
+    else:
+        source_reason = reason
 
-    new_row = f"| **{comp_name}** | {reason} | {website} | {ats_info} | {notes} |\n"
+    status_notes = f"Added via News Sync - {today_str}"
+    if not ats_info or ats_info == "Auto":
+        ats_info = "N/A"
+
+    new_row = f"| **{comp_name}** | {source_reason} | {website} | {ats_info} | {status_notes} |\n"
     
     parts = content.split("### 🎯 Target Companies Config\n")
     if len(parts) == 2:
@@ -348,9 +382,10 @@ def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website,
 
 def extract_funding_news_and_update_targets(news_sources, max_new_companies=100):
     logger.info("Extracting funded startup entity leads from news sources...")
+    funding_verbs = r'(?:raises|raised|secures|secured|nabs|nabbed|bags|bagged|closes|closed|lands|landed|locks in|locked in|pulls in|pulled in|hauls in|hauled in|scoops up|scooped up|picks up|picked up|fetches|fetched|attracts|attracted|obtains|obtained|banks|banked|gets|got|hits)'
     funding_patterns = [
-        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,25})\s+(?:raises|raised|secures|secured|snags|snagged|bags|bagged|nabs|nabbed|closes|closed|lands|landed)\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?(?:\s+(?:Series\s+[A-E]|growth|funding|valuation))?)', re.IGNORECASE),
-        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,25})\s+hits\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?\s*valuation)', re.IGNORECASE)
+        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,30})\s+' + funding_verbs + r'\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?(?:\s+(?:Series\s+[A-F]|growth|funding|valuation|seed))?)', re.IGNORECASE),
+        re.compile(r'([A-Z][A-Za-z0-9\.\-\s]{2,30})\s+hits\s+(\$\d+(?:\.\d+)?\s*(?:M|B|million|billion)?\s*valuation)', re.IGNORECASE)
     ]
 
     discovered_companies = []
@@ -367,9 +402,11 @@ def extract_funding_news_and_update_targets(news_sources, max_new_companies=100)
                 record_log(s_name, s_url, "Success (200)", f"Fetched news feed successfully ({len(r.text)} bytes)")
                 soup = BeautifulSoup(r.text, "html.parser")
                 
-                for a in soup.find_all('a', href=True):
-                    txt = sanitize_text(a.get_text())
-                    href = a['href']
+                # Check anchor links, headings, article containers, and text elements
+                items = soup.find_all(['a', 'h1', 'h2', 'h3', 'article', 'p', 'div'])
+                for item in items:
+                    txt = sanitize_text(item.get_text())
+                    href = item.get('href') or (item.find('a', href=True)['href'] if item.find('a', href=True) else s_url)
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(s_url, href)
 
@@ -385,7 +422,7 @@ def extract_funding_news_and_update_targets(news_sources, max_new_companies=100)
                                     website = resolve_company_domain(comp_clean, txt, href)
                                     reason = f"Funding News ({s_name}: {fund})"
                                     added, session_count = append_new_target_company_to_pipeline_with_limit(
-                                        comp_clean, reason, website, ats_info="Auto", article_url=href,
+                                        comp_clean, reason, website, ats_info="N/A", article_url=href,
                                         max_new_companies=max_new_companies, current_session_count=session_count
                                     )
                                     if added:
