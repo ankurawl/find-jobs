@@ -190,25 +190,46 @@ AGGREGATOR_DOMAINS = {
     "linkedin.com", "twitter.com", "x.com", "facebook.com", "youtube.com",
     "github.com", "wikipedia.org", "medium.com", "news.ycombinator.com",
     "bloomberg.com", "reuters.com", "wsj.com", "forbes.com",
-    "businessinsider.com", "prnewswire.com", "businesswire.com", "globenewswire.com"
+    "businessinsider.com", "prnewswire.com", "businesswire.com", "globenewswire.com",
+    "crunchboard.com", "strictlyvc.com", "cision.com", "domguzman.com",
+    "doubleclick.net", "googleadservices.com", "googlesyndication.com",
+    "wordpress.org", "schema.org", "w3.org", "apple.com", "google.com",
+    "microsoft.com", "amazon.com", "cloudflare.com", "fastly.com", "akamai.com",
+    "zendesk.com", "hubspot.com", "intercom.io", "salesforce.com", "marketo.com", "drift.com"
 }
-
-NOISE_PREFIXES = [
-    r'^(?:As|The|AI|New|Startup|Tech|How|Why|What|After|With|About|For|In|On)\s+',
-    r'^(?:bot-detection startup|synthetic-user startup|edtech platform|training platform|battery storage startup|cloud security startup|cybersecurity startup|fintech startup|healthtech startup|medtech startup|biotech startup|stealth startup)\s+',
-    r'^(?:ery storage startup|ning platform|form)\s+'
-]
 
 def clean_company_name(name):
     if not name:
         return ""
     clean = name.strip()
-    for pat in NOISE_PREFIXES:
-        clean = re.sub(pat, '', clean, flags=re.IGNORECASE).strip()
-    clean = re.sub(r'^[^\w]+', '', clean)
-    return clean
+    
+    # Take last clause if comma separated
+    if "," in clean:
+        clean = clean.split(",")[-1].strip()
+    
+    # Strip common leading industry descriptors and noise words
+    descriptors = [
+        r'\b(?:synthetic-user|bot-detection|bot detection|battery storage|cloud security|cybersecurity|edtech|healthtech|medtech|biotech|fintech|stealth|enterprise saas training|training|logistics|robotics|climate|venture)\b',
+        r'\b(?:startup|startups|platform|platforms|company|firm|provider|developer|builder|app|tool|service|solution|system)\b',
+        r'\b(?:as|the|a|an|new|how|why|what|after|with|about|for|in|on)\b'
+    ]
+    
+    for desc in descriptors:
+        clean = re.sub(desc, '', clean, flags=re.IGNORECASE).strip()
+    
+    # Clean leading punctuation
+    clean = re.sub(r'^[^\w]+', '', clean).strip()
+    
+    # Extract trailing proper noun / title case phrase
+    m = re.search(r'([A-Z][A-Za-z0-9\.\-\&]+(?:\s+[A-Z0-9][A-Za-z0-9\.\-\&]+)*)$', clean)
+    if m:
+        return m.group(1).strip()
+        
+    return clean.strip()
 
 def is_aggregator_domain(url):
+    if not url:
+        return True
     try:
         netloc = urllib.parse.urlparse(url).netloc.lower()
         if netloc.startswith("www."):
@@ -261,26 +282,18 @@ def search_ddg_html(query):
     return list(dict.fromkeys(urls))
 
 def verify_and_select_best_domain(candidate_urls, company_name, news_context):
-    """Scrapes candidate landing pages and scores against news context to select official domain."""
-    if not candidate_urls:
-        slug = company_name.lower().replace(" ", "").replace(".", "")
-        return f"https://{slug}.com"
+    """
+    Empirically verifies candidate website landing pages by probing HTTP status, page title,
+    and meta description to confirm the official domain for company_name.
+    """
+    c_words = [w.lower() for w in re.findall(r'\w+', company_name) if len(w) >= 3]
+    if not c_words:
+        c_words = [company_name.lower().strip()]
 
-    c_name_norm = company_name.lower().strip()
-    c_words = set(re.findall(r'\w+', c_name_norm))
-    ignore_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "raises", "raised", "funding", "series", "million", "billion"}
-    ctx_words = set(re.findall(r'\w+', news_context.lower())) - ignore_words
-
-    best_url = candidate_urls[0]
-    best_score = -1
-
-    for url in candidate_urls[:3]:
-        score = 0
+    for url in candidate_urls:
+        if is_aggregator_domain(url):
+            continue
         try:
-            domain = urllib.parse.urlparse(url).netloc.lower()
-            if any(w in domain for w in c_words if len(w) >= 3):
-                score += 10
-
             r = curl_requests.get(url, impersonate="chrome", timeout=6)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -290,31 +303,46 @@ def verify_and_select_best_domain(candidate_urls, company_name, news_context):
                 if meta_tag:
                     meta_desc = (meta_tag.get("content") or "").lower()
 
-                combined_text = title + " " + meta_desc
-                if any(w in combined_text for w in c_words if len(w) >= 3):
-                    score += 15
-
-                overlap = len(ctx_words.intersection(set(re.findall(r'\w+', combined_text))))
-                score += overlap * 2
-
-                if score > best_score:
-                    best_score = score
-                    best_url = url
+                combined = title + " " + meta_desc
+                # Verify company name or primary word exists in landing page title or meta description
+                if any(w in combined for w in c_words):
+                    parsed_res = urllib.parse.urlparse(r.url)
+                    root_domain = f"{parsed_res.scheme}://{parsed_res.netloc}"
+                    return root_domain
         except Exception:
             pass
 
-    return best_url.rstrip("/")
+    # Fallback to first non-aggregator candidate root domain if landing page content is JS rendered
+    for url in candidate_urls:
+        if not is_aggregator_domain(url):
+            parsed_res = urllib.parse.urlparse(url)
+            return f"{parsed_res.scheme}://{parsed_res.netloc}"
+
+    c_slug = company_name.lower().replace(" ", "").replace(".", "")
+    return f"https://{c_slug}.com"
 
 def resolve_company_domain(company_name, news_context, article_url=None):
-    """3-stage domain resolution: 1. Article links, 2. Web search fallback, 3. Context verification."""
+    """
+    3-Stage Domain Resolution:
+    Stage 1: Inspect outbound links from the news article.
+    Stage 2: Targeted web search with rich company & news context.
+    Stage 3: Scrape & verify candidate landing page title/meta description before accepting.
+    """
     candidates = []
     if article_url:
         candidates = extract_article_links(article_url)
-    if not candidates:
-        candidates = search_ddg_html(f"{company_name} official website startup")
-    return verify_and_select_best_domain(candidates, company_name, news_context)
+    
+    # Stage 2: Perform targeted DDG search with rich company and context keywords
+    clean_ctx = re.sub(r'[^\w\s]', ' ', news_context)
+    ctx_keywords = " ".join([w for w in clean_ctx.split() if len(w) >= 4 and w.lower() not in ["funding", "news", "raises", "raised", "series", "million", "billion"]][:4])
+    
+    search_query = f"{company_name} {ctx_keywords} official website"
+    ddg_candidates = search_ddg_html(search_query)
+    
+    all_candidates = list(dict.fromkeys(candidates + ddg_candidates))
+    return verify_and_select_best_domain(all_candidates, company_name, news_context)
 
-def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website, ats_info="Auto", article_url=None, max_new_companies=100, current_session_count=0):
+def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website, ats_info="N/A", article_url=None, max_new_companies=100, current_session_count=0):
     if current_session_count >= max_new_companies:
         logger.warning(f"Reached max session limit of {max_new_companies} new companies added to Pipeline.md.")
         return False, current_session_count
@@ -328,12 +356,18 @@ def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website,
         return False, current_session_count
 
     today_str = datetime.now().strftime("%b %d, %Y")
-    notes = f"Added via News Sync ({reason})"
+    
+    # Format Source / Reason with hyperlinked news article URL if present
     if article_url:
-        notes += f" | Article: {article_url}"
-    notes += f" - {today_str}"
+        source_reason = f"[{reason}]({article_url})"
+    else:
+        source_reason = reason
 
-    new_row = f"| **{comp_name}** | {reason} | {website} | {ats_info} | {notes} |\n"
+    status_notes = f"Added via News Sync - {today_str}"
+    if not ats_info or ats_info == "Auto":
+        ats_info = "N/A"
+
+    new_row = f"| **{comp_name}** | {source_reason} | {website} | {ats_info} | {status_notes} |\n"
     
     parts = content.split("### 🎯 Target Companies Config\n")
     if len(parts) == 2:
@@ -435,10 +469,10 @@ def extract_funding_news_and_update_targets(news_sources, max_new_companies=100,
                 out_of_date_count = 0
                 valid_items_count = 0
 
-                anchors = soup.find_all('a', href=True)
-                for a in anchors:
-                    txt = sanitize_text(a.get_text())
-                    href = a['href']
+                items = soup.find_all(['a', 'h1', 'h2', 'h3', 'article', 'p', 'div'])
+                for item in items:
+                    txt = sanitize_text(item.get_text())
+                    href = item.get('href') or (item.find('a', href=True)['href'] if item.find('a', href=True) else page_url)
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(s_url, href)
 
@@ -468,7 +502,7 @@ def extract_funding_news_and_update_targets(news_sources, max_new_companies=100,
                                     website = resolve_company_domain(comp_clean, txt, href)
                                     reason = f"Funding News ({s_name}: {fund})"
                                     added, session_count = append_new_target_company_to_pipeline_with_limit(
-                                        comp_clean, reason, website, ats_info="Auto", article_url=href,
+                                        comp_clean, reason, website, ats_info="N/A", article_url=href,
                                         max_new_companies=max_new_companies, current_session_count=session_count
                                     )
                                     if added:
@@ -609,32 +643,34 @@ def scrape_jobs_directly_from_company_website(company, direct_keywords):
         website.rstrip("/") + "/join-us"
     ]
 
-    kw_list = [kw.lower() for kw in direct_keywords] if direct_keywords else ['product manager', 'engineer', 'developer', 'manager', 'lead']
-
     for c_url in candidate_career_urls:
         try:
             r = curl_requests.get(c_url, impersonate="chrome", timeout=8)
             if r.status_code == 200:
-                record_log(f"{c_name} Website", c_url, "Success (200)", "Direct career website page scraped successfully")
                 soup = BeautifulSoup(r.text, "html.parser")
                 links = soup.find_all("a", href=True)
+                kw_list = [kw.lower() for kw in direct_keywords] if direct_keywords else ['product manager', 'engineer', 'developer', 'manager', 'lead', 'principal', 'staff']
                 for link in links:
                     t_text = sanitize_text(link.get_text())
                     href = link["href"]
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(c_url, href)
-                    
+
                     if any(kw in t_text.lower() for kw in kw_list):
-                        found_jobs.append({
-                            "company": c_name,
-                            "title": t_text,
-                            "location": "US (Remote / On-site)",
-                            "url": href,
-                            "source": f"{c_name} Direct Career Site",
-                            "comp": "$200K - $350K + Equity",
-                            "domain": f"Direct Website Career Page ({c_name})"
-                        })
+                        details = extract_job_details_from_link(href, t_text, c_name)
+                        if details and details.get("title") and len(details["title"]) >= 4:
+                            if not any(j["url"] == details["url"] for j in found_jobs):
+                                found_jobs.append({
+                                    "company": c_name,
+                                    "title": details["title"],
+                                    "location": details.get("location") or "US (Remote / On-site)",
+                                    "url": details["url"],
+                                    "source": f"{c_name} Direct Career Site",
+                                    "comp": "$200K - $350K + Equity",
+                                    "domain": f"Direct Website Career Page ({c_name})"
+                                })
                 if found_jobs:
+                    record_log(f"{c_name} Website", c_url, "Success (200)", f"Discovered {len(found_jobs)} jobs via direct career site")
                     break
         except Exception as e:
             logger.debug(f"Error scraping career site {c_url}: {e}")
@@ -644,10 +680,54 @@ def scrape_jobs_directly_from_company_website(company, direct_keywords):
 def web_search_careers_page_fallback(company):
     """Probe 3: Web search for company careers/jobs page if ATS and direct site probing yield 0 jobs."""
     c_name = company["name"]
-    found_jobs = []
-    search_results = search_ddg_html(f"{c_name} careers jobs ashby OR greenhouse OR lever")
+    c_slug = company.get("slug", "")
+    c_website = company.get("website", "")
+    c_domain = ""
+    if c_website:
+        parsed_web = urllib.parse.urlparse(c_website)
+        c_domain = parsed_web.netloc.lower().replace("www.", "")
 
-    for url in search_results[:3]:
+    found_jobs = []
+    search_results = search_ddg_html(f"{c_name} careers jobs ashby OR greenhouse OR lever OR workday")
+
+    KNOWN_ATS_DOMAINS = [
+        "greenhouse.io", "ashbyhq.com", "lever.co", "workday.com",
+        "myworkdayjobs.com", "smartrecruiters.com", "icims.com",
+        "bamboohr.com", "rippling.com"
+    ]
+
+    c_name_norm = normalize_text(c_name)
+    c_slug_norm = normalize_text(c_slug)
+    c_domain_norm = normalize_text(c_domain)
+
+    for url in search_results[:5]:
+        url_lower = url.lower()
+        parsed_res = urllib.parse.urlparse(url)
+        res_netloc = parsed_res.netloc.lower().replace("www.", "")
+
+        # Target search result URL MUST belong to the target company domain or a recognized ATS domain
+        is_company_domain = c_domain and (c_domain in res_netloc or res_netloc in c_domain)
+        is_ats_domain = any(ats in res_netloc for ats in KNOWN_ATS_DOMAINS)
+
+        if not (is_company_domain or is_ats_domain):
+            continue
+
+        if is_ats_domain and not is_company_domain:
+            ats_match = re.search(r'(?:greenhouse\.io|ashbyhq\.com|lever\.co|myworkdayjobs\.com|workday\.com)/([^/\?]+)', url, re.IGNORECASE)
+            if ats_match:
+                ats_slug = normalize_text(ats_match.group(1))
+                matches_company = (
+                    (ats_slug and ats_slug in c_name_norm) or
+                    (c_name_norm and c_name_norm in ats_slug) or
+                    (c_slug_norm and (ats_slug in c_slug_norm or c_slug_norm in ats_slug)) or
+                    (c_domain_norm and (ats_slug in c_domain_norm or c_domain_norm in ats_slug))
+                )
+                if not matches_company:
+                    continue
+
+        if any(pat in url_lower for pat in ["/blog", "/news", "/press", "/article", "/post", "/event", "/podcast", "/story"]):
+            continue
+
         try:
             r = curl_requests.get(url, impersonate="chrome", timeout=8)
             if r.status_code == 200:
@@ -658,16 +738,19 @@ def web_search_careers_page_fallback(company):
                     href = link["href"]
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(url, href)
-                    if len(t_text) >= 8 and any(kw in t_text.lower() for kw in ['product manager', 'lead', 'senior', 'principal', 'staff', 'manager']):
-                        found_jobs.append({
-                            "company": c_name,
-                            "title": t_text,
-                            "location": "US (Remote / On-site)",
-                            "url": href,
-                            "source": f"{c_name} Web Search Careers Link",
-                            "comp": "$200K - $350K + Equity",
-                            "domain": f"Web Search Discovery ({c_name})"
-                        })
+
+                    details = extract_job_details_from_link(href, t_text, c_name)
+                    if details and details.get("title") and len(details["title"]) >= 4:
+                        if not any(j["url"] == details["url"] for j in found_jobs):
+                            found_jobs.append({
+                                "company": c_name,
+                                "title": details["title"],
+                                "location": details.get("location") or "US (Remote / On-site)",
+                                "url": details["url"],
+                                "source": f"{c_name} Web Search Careers Link",
+                                "comp": "$200K - $350K + Equity",
+                                "domain": f"Web Search Discovery ({c_name})"
+                            })
                 if found_jobs:
                     record_log(f"{c_name} Web Search", url, "Success (200)", f"Discovered {len(found_jobs)} jobs via web search fallback")
                     break
@@ -689,16 +772,43 @@ def extract_job_details_from_link(href, text, source_name):
     if not text_clean or len(text_clean) < 3:
         return None
 
+    parsed_url = urllib.parse.urlparse(href)
+    path_segments = [p for p in parsed_url.path.rstrip("/").split("/") if p]
+
+    # Root domain URLs without paths (e.g. https://jazzhr.com) are not job postings
+    if not path_segments:
+        return None
+
+    # Single top-level generic marketing/corporate paths are not job postings
+    generic_marketing_paths = {
+        "company", "about", "features", "pricing", "solutions", "contact",
+        "login", "signup", "terms", "privacy", "security", "product", "platform",
+        "home", "overview", "team", "press", "events", "resources", "blog"
+    }
+    if len(path_segments) == 1 and path_segments[0].lower() in generic_marketing_paths:
+        return None
+
+    # Ignore PDF documents (e.g. EEOC posters, legal notices, guidelines)
+    if url_lower.endswith(".pdf") or ".pdf?" in url_lower:
+        return None
+
+    # Ignore Builtin category/listing pages or awards pages that are not individual job postings
+    if "builtin.com" in url_lower:
+        if re.search(r'builtin\.com/jobs(?:/|\?|$)', url_lower) or any(p in url_lower for p in ["/awards", "/companies", "/salaries", "/tech-"]):
+            return None
+
     # 1. Non-job URL blacklist (including corporate SaaS marketing paths & external news/media domains)
     ignored_url_patterns = [
         "/categories", "/investors", "/stages", "/industries", "/locations",
         "/faq", "/salaries", "/companies", "/hire", "/privacy", "/terms", "/legal",
         "/login", "/signup", "tally.so", "/tech-topics", "/tech-hubs",
-        "/tech-dictionary", "/about", "/news", "/category/", "/blogs/", "/post/",
-        "/demo", "/pricing", "/security", "/roi", "/events", "/webinars",
+        "/tech-dictionary", "/about", "/news", "/category/", "/blogs", "/blog",
+        "/post", "/posts", "/article", "/articles", "/press", "/story", "/stories",
+        "/resource", "/resources", "/webinar", "/webinars", "/event", "/events",
+        "/podcast", "/podcasts", "/demo", "/pricing", "/security", "/roi",
         "/customer-stories", "/glossary", "/onboarding", "/integrations",
         "/content-topic/", "/compare", "/platform", "/enterprise", "/support",
-        "/guidance", "/resources", "/talent-makers", "/latest-features", "/sponsor",
+        "/guidance", "/talent-makers", "/latest-features", "/sponsor", ".pdf",
         "learn.greenhouse.io", "support.greenhouse.io", "developers.greenhouse.io",
         "my.greenhouse.com", "app.greenhouse.io", "techcrunch.com", "finsmes.com",
         "upstartsmedia.com", "fundraiseinsider.com", "reuters.com", "citybiz.co",
@@ -725,22 +835,35 @@ def extract_job_details_from_link(href, text, source_name):
         "talent matching", "onboarding", "reporting & insights", "integrations",
         "early-stage business", "scaling company", "modern enterprise", "job seekers",
         "how we compare", "return on your hiring", "your partner in success", "guidance",
-        "source", "link", "see all investors", "categories", "explore", "sponsor", "investors"
+        "source", "link", "see all investors", "categories", "explore", "sponsor", "investors",
+        "best places to work", "explore companies hiring", "see all remote tech jobs",
+        "job search", "search jobs", "search all jobs", "explore jobs", "open jobs",
+        "open roles", "view jobs", "view open positions", "career opportunities",
+        "search positions", "job openings", "current openings", "workday", "ashby",
+        "greenhouse", "lever", "work", "life", "today", "carrier deals", "eeo rights",
+        "know your rights", "fair chance"
     ]
-    if text_lower in ignored_text_terms or any(term in text_lower for term in ["join our talent pool", "explore 100k+", "what's it like to work at", "request a demo", "skip to content", "see all investors"]):
+    ignored_substring_terms = [
+        "join our talent pool", "explore 100k+", "what's it like to work at", "request a demo",
+        "skip to content", "see all investors", "best places to work", "tech jobs & startup jobs",
+        "know your rights", "work at", "life at", "carrier deals", "eeo rights", "fair chance",
+        "work at apple", "life at apple", "job search", "search jobs", "explore companies"
+    ]
+    if text_lower in ignored_text_terms or any(term in text_lower for term in ignored_substring_terms):
         return None
 
     company = ""
     title = text_clean
     location = "US / Unspecified"
 
-    # Known ATS root domain check: if URL is an ATS domain without a company slug & job ID, discard it
-    if any(host in url_lower for host in ["greenhouse.io", "ashbyhq.com", "lever.co"]):
+    # Known ATS root domain check: if URL is an ATS domain without a company slug & valid job ID, discard it
+    if any(host in url_lower for host in ["greenhouse.io", "ashbyhq.com", "lever.co", "myworkdayjobs.com", "workday.com"]):
         is_valid_ats_job = (
-            re.search(r'greenhouse\.io/([^/]+)/jobs/', href, re.IGNORECASE) or
+            re.search(r'greenhouse\.io/([^/]+)/jobs/\d+', href, re.IGNORECASE) or
             re.search(r'greenhouse\.io/embed/job_board\?for=([^&]+)', href, re.IGNORECASE) or
-            re.search(r'ashbyhq\.com/([^/]+)/[a-f0-9-]+', href, re.IGNORECASE) or
-            re.search(r'lever\.co/([^/]+)/[a-f0-9-]+', href, re.IGNORECASE)
+            re.search(r'ashbyhq\.com/([^/]+)/[a-f0-9]{8}-', href, re.IGNORECASE) or
+            (re.search(r'lever\.co/([^/]+)/[a-f0-9-]{15,}', href, re.IGNORECASE) and "/blog" not in url_lower) or
+            re.search(r'(?:myworkdayjobs\.com|workday\.com)/.*?/(?:job|job-detail)/', href, re.IGNORECASE)
         )
         if not is_valid_ats_job:
             return None
@@ -756,7 +879,7 @@ def extract_job_details_from_link(href, text, source_name):
         "anthropic": "Anthropic"
     }
 
-    # A. Extract Company from ATS URL structure if present
+    # A. Extract Company from ATS / Job Board URL structure if present
     # Greenhouse: job-boards.greenhouse.io/<company_slug>/jobs/<id>
     gh_match = re.search(r'greenhouse\.io/([^/]+)/jobs/', href, re.IGNORECASE)
     if not gh_match:
@@ -780,23 +903,30 @@ def extract_job_details_from_link(href, text, source_name):
             company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
 
     # Built In job URLs: builtin.com/company/<slug>/jobs/ or builtin.com/job/...
-    if not company:
+    if not company and "builtin.com" in url_lower:
         bi_match = re.search(r'builtin\.com/company/([^/]+)/', href, re.IGNORECASE)
         if bi_match:
             slug = bi_match.group(1).lower()
             company = SLUG_NAME_OVERRIDES.get(slug, slug.replace("-", " ").replace("_", " ").title())
 
-    # B. Parse structured link text (e.g. "TitleCompany · Location · Date")
+    # B. Parse structured link text (e.g. "Title · Company · Location", "Title · Location", "Title - Company")
     parts = [p.strip() for p in text_clean.split("·") if p.strip()]
-    if len(parts) >= 2:
+    if len(parts) >= 3:
+        title = parts[0]
+        if not company:
+            company = parts[1].title()
+        location = parts[2]
+    elif len(parts) == 2:
         if parts[-1].lower().startswith("posted on"):
             parts.pop()
         
         if len(parts) >= 2 and any(loc_kw in parts[-1].lower() for loc_kw in ["remote", "hybrid", "on-site", "united states", "canada", "sf", "ny", "ca", "tx", "wa", "ma", "co"]):
             location = parts[-1]
-            title_part = " · ".join(parts[:-1])
+            title_part = parts[0]
         else:
             title_part = parts[0]
+            if not company:
+                company = parts[1].title()
 
         if company:
             comp_pattern = re.escape(company)
@@ -832,15 +962,24 @@ def extract_job_details_from_link(href, text, source_name):
 
     title = re.sub(r'\s+', ' ', title).strip(" -|·")
 
+    # If company is still empty, check URL netloc ONLY if netloc is not a known job board / aggregator domain
     if not company:
+        source_norm = source_name.lower().replace(" ", "").replace("-", "").replace("_", "")
         parsed_url = urllib.parse.urlparse(href)
-        if parsed_url.netloc and source_name.lower() not in parsed_url.netloc.lower():
+        netloc_norm = parsed_url.netloc.lower().replace(" ", "").replace("-", "").replace("_", "")
+        if parsed_url.netloc and source_norm not in netloc_norm:
             host_parts = parsed_url.netloc.split(".")
             if len(host_parts) >= 2:
                 company = host_parts[-2].capitalize()
 
-    # Discard any entry where real company could not be resolved or is a generic placeholder
-    if not company or company.lower() in ("greenhouse", "ashby", "lever", "company", "unknown") or company.startswith("Company via"):
+    # Discard any entry where real company could not be resolved or is a generic/job board placeholder
+    FORBIDDEN_COMPANIES = {
+        "greenhouse", "ashby", "lever", "company", "unknown", "builtin", "built in",
+        "indeed", "wellfound", "crunchbase", "workday", "startups gallery",
+        "startups gallery jobs", "job board", "techcrunch", "venturebeat", "linkedin",
+        "glassdoor", "ziprecruiter", "simplyhired", "monster"
+    }
+    if not company or company.lower() in FORBIDDEN_COMPANIES or company.startswith("Company via"):
         return None
 
     if len(title) < 4:
@@ -982,62 +1121,121 @@ def discover_raw_jobs_for_company(company, direct_keywords):
 
 # --- Filtering & Deduplication ---
 
-def is_matching_role(title, filter_criteria):
+def evaluate_role_match(title, filter_criteria):
+    """
+    Evaluates if title matches PM target roles.
+    Returns (is_match: bool, reason: str).
+    """
     t = title.lower()
 
     exclude_mgmt = filter_criteria.get("exclude_management_keywords", [])
-    if any(rej in t for rej in exclude_mgmt if rej):
-        return False
+    for rej in exclude_mgmt:
+        if rej and rej.lower() in t:
+            return False, f"Excluded Management Keyword ('{rej}' in title)"
 
     exclude_roles = filter_criteria.get("exclude_role_keywords", [])
-    if any(rej in t for rej in exclude_roles if rej):
-        return False
+    for rej in exclude_roles:
+        if rej and rej.lower() in t:
+            return False, f"Excluded Role Keyword ('{rej}' in title)"
 
     include_patterns = filter_criteria.get("include_role_patterns", [])
     if include_patterns:
         matches_pattern = any(re.search(pat, t, re.IGNORECASE) for pat in include_patterns)
         if not matches_pattern:
-            return False
+            return False, f"Role Mismatch (title '{title}' does not match target PM patterns)"
 
-    return True
+    return True, "Role Matched"
 
-def is_eligible_location(loc_str, title_str, filter_criteria):
+def is_matching_role(title, filter_criteria):
+    matched, _ = evaluate_role_match(title, filter_criteria)
+    return matched
+
+def evaluate_location_eligibility(loc_str, title_str, filter_criteria):
+    """
+    Evaluates location eligibility based on US target geography.
+    Returns (is_eligible: bool, reason: str).
+    """
     title_lower = str(title_str).lower()
     loc_lower = str(loc_str).lower()
 
     excluded_locs = filter_criteria.get("excluded_location_keywords", [])
     allowed_locs = filter_criteria.get("allowed_location_keywords", [])
 
-    if any(term in title_lower for term in excluded_locs if len(term) > 3):
-        return False
+    for term in excluded_locs:
+        if len(term) > 3 and term.lower() in title_lower:
+            return False, f"Excluded Region in Title ('{term}' in title)"
 
     has_allowed = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in allowed_locs if term)
     
     if loc_str in ('US (Remote / On-site)', 'US / Unspecified') or has_allowed:
-        return True
+        return True, "US Eligible Location"
 
     has_excluded = any(re.search(r'\b' + re.escape(term) + r'\b', loc_lower) for term in excluded_locs if term)
     if has_excluded and not has_allowed:
-        return False
+        return False, f"Non-US Location ('{loc_str}' contains excluded region)"
 
-    return True
+    return False, f"Ineligible Location ('{loc_str}' not in allowed US target geographies)"
 
-def calculate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+def is_eligible_location(loc_str, title_str, filter_criteria):
+    eligible, _ = evaluate_location_eligibility(loc_str, title_str, filter_criteria)
+    return eligible
+
+def evaluate_salary_eligibility(comp_str, filter_criteria):
+    """
+    Evaluates salary eligibility against min_base_salary_usd.
+    Returns (is_eligible: bool, reason: str).
+    """
+    if not comp_str:
+        return True, "Salary Unspecified"
+
+    min_sal = filter_criteria.get("min_base_salary_usd", 200000)
+    matches = re.findall(r'\$(\d{1,3}(?:,\d{3})*|\d+)\s*(k|thousand)?', comp_str, re.IGNORECASE)
+    if matches:
+        amounts = []
+        for val, mult in matches:
+            val_num = int(val.replace(",", ""))
+            if mult.lower() == "k":
+                val_num *= 1000
+            if val_num < 1000 and val_num > 0:
+                val_num *= 1000
+            amounts.append(val_num)
+        if amounts:
+            max_amount = max(amounts)
+            if max_amount < min_sal:
+                return False, f"Salary Too Low ({comp_str} < ${min_sal:,} min base)"
+
+    return True, "Salary Eligible"
+
+def evaluate_company_eligibility(company_name, filter_criteria):
+    """
+    Evaluates company against excluded company list.
+    Returns (is_eligible: bool, reason: str).
+    """
+    excluded_comps = filter_criteria.get("excluded_company_names", [])
+    for ex in excluded_comps:
+        if ex and ex.lower() in company_name.lower():
+            return False, f"Excluded Company ('{company_name}' matches excluded company '{ex}')"
+    return True, "Company Eligible"
+
+def evaluate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+    """
+    Calculates fit score and returns (score: int, details: str).
+    """
     fit_cfg = filter_criteria.get("fit_scoring", {})
     base_score = fit_cfg.get("base_score", 50)
     score = base_score
     combined = (title + " " + domain_text).lower()
 
-    excluded_comps = filter_criteria.get("excluded_company_names", [])
-    if any(ex.lower() in company_name.lower() for ex in excluded_comps if ex):
-        return 0
+    reasons = []
 
     keyword_boosts = fit_cfg.get("keyword_boosts", [])
     for boost in keyword_boosts:
         weight = boost.get("weight", 10)
         patterns = boost.get("patterns", [])
-        if any(re.search(r'\b' + re.escape(p.lower()) + r'\b', combined) for p in patterns):
+        matched_pats = [p for p in patterns if re.search(r'\b' + re.escape(p.lower()) + r'\b', combined)]
+        if matched_pats:
             score += weight
+            reasons.append(f"+{weight}% for '{matched_pats[0]}'")
 
     comp_boost_cfg = fit_cfg.get("compensation_boost", {})
     min_sal = comp_boost_cfg.get("min_salary", 200000)
@@ -1045,8 +1243,15 @@ def calculate_fit_score(title, domain_text, comp_text, company_name, filter_crit
 
     if str(min_sal) in comp_text or "$200k" in comp_text.lower() or "$2" in comp_text:
         score += weight
+        reasons.append(f"+{weight}% for comp ${min_sal:,}+")
 
-    return min(100, max(0, score))
+    final_score = min(100, max(0, score))
+    detail_str = f"boosts: {', '.join(reasons)}" if reasons else "no keyword/comp boosts matched"
+    return final_score, detail_str
+
+def calculate_fit_score(title, domain_text, comp_text, company_name, filter_criteria):
+    score, _ = evaluate_fit_score(title, domain_text, comp_text, company_name, filter_criteria)
+    return score
 
 def extract_job_id_from_url(url):
     if not url:
@@ -1243,29 +1448,38 @@ def collect_all_raw_jobs(config, max_new_companies=100):
     return raw_jobs
 
 def filter_and_score_jobs(raw_jobs, filter_criteria):
-    """Step 2: Apply role matching, location eligibility, and fit score threshold evaluation."""
+    """Step 2: Apply role matching, location eligibility, salary, company & fit score evaluation with detailed rejection reasons."""
     threshold = filter_criteria.get("fit_scoring", {}).get("fit_score_threshold_percent", 75)
     filtered_jobs = []
     step2_evaluations = []
 
     for j in raw_jobs:
-        role_pass = is_matching_role(j["title"], filter_criteria)
-        loc_pass = is_eligible_location(j["location"], j["title"], filter_criteria)
+        comp_pass, comp_reason = evaluate_company_eligibility(j["company"], filter_criteria)
+        role_pass, role_reason = evaluate_role_match(j["title"], filter_criteria)
+        loc_pass, loc_reason = evaluate_location_eligibility(j["location"], j["title"], filter_criteria)
+        sal_pass, sal_reason = evaluate_salary_eligibility(j.get("comp", ""), filter_criteria)
 
+        rejection_reasons = []
+        if not comp_pass:
+            rejection_reasons.append(comp_reason)
         if not role_pass:
-            status = "Rejected (Role Mismatch)"
-            is_passed = False
-        elif not loc_pass:
-            status = "Rejected (Location Non-US)"
+            rejection_reasons.append(role_reason)
+        if not loc_pass:
+            rejection_reasons.append(loc_reason)
+        if not sal_pass:
+            rejection_reasons.append(sal_reason)
+
+        if rejection_reasons:
+            status = f"Rejected ({'; '.join(rejection_reasons)})"
             is_passed = False
         else:
-            score = calculate_fit_score(j["title"], j["domain"], j["comp"], j["company"], filter_criteria)
+            score, score_detail = evaluate_fit_score(j["title"], j["domain"], j.get("comp", ""), j["company"], filter_criteria)
             if score >= threshold:
                 status = f"PASSED ({score}%)"
                 is_passed = True
                 filtered_jobs.append(j)
             else:
-                status = f"Rejected (Low Fit Score: {score}%)"
+                status = f"Rejected (Low Fit Score: {score}% < {threshold}% - {score_detail})"
                 is_passed = False
 
         step2_evaluations.append({
