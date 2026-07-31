@@ -11,4 +11,4 @@
 
 ### Execution Rules
 - **Python Interpreter**: Always run scripts using the project's virtual environment (`.venv/bin/python`).
-- **Data Location Configuration**: All data file locations (`Profile.md`, `Pipeline.md`, `config.json`, `job-leads.md`, `logs/`) are resolved dynamically via the root `.env` file (`JOB_DATA_DIR`).
+- **Data Location Configuration**: All data file locations (`Profile.md`, `Pipeline.md`, `target-companies.md`, `config.json`, `job-leads.md`, `logs/`) are resolved dynamically via the root `.env` file (`JOB_DATA_DIR`).

@@ -10,14 +10,14 @@ This skill defines the instructions and automated workflow for discovering high-
 
 ## Data Configuration (.env & config.json)
 - The execution engine resolves the target data directory dynamically from `.env` (`JOB_DATA_DIR`).
-- Target data directory contains `Profile.md`, `Pipeline.md`, `config.json`, and `job-leads.md`.
+- Target data directory contains `Profile.md`, `Pipeline.md`, `target-companies.md`, `config.json`, and `job-leads.md`.
 
 ## Core Rules & Criteria
 1. **Virtual Environment**: ALWAYS use the Python virtual environment located at `/home/agag/Documents/find-jobs/.venv/bin/python` for executing `/home/agag/Documents/find-jobs/find_jobs.py` or `debug_job_finder.py`.
 2. **Sources & Dynamic Discovery**:
    - **Funding News Entity Extractor**: Scrapes news sources from `funding_news_sources` in `config.json` (TechCrunch, VentureBeat, Crunchbase News, etc.) to discover newly funded startups.
    - **Domain Resolution & Verification**: Resolves company website domains via outbound article link parsing, DuckDuckGo HTML web search fallback, and landing page content/meta verification.
-   - **Target Sync Limit**: Appends newly discovered target companies to `Pipeline.md` under `### 🎯 Target Companies Config` up to a **max limit of 100 new companies per session**.
+   - **Target Sync Limit**: Appends newly discovered target companies to `target-companies.md` under `# 🎯 Target Companies Config` up to a **max limit of 100 new companies per session**.
    - **Multi-Probe Career Discovery**:
      - *Probe 1*: Major ATS platform APIs (`Ashby`, `Greenhouse`, `Lever`) using derived company slugs.
      - *Probe 2*: Direct website career pages (`/careers`, `/jobs`, `/about/careers`, `/join-us`).

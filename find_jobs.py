@@ -5,9 +5,9 @@ Comprehensive Ground-Truth Job Discovery Engine.
 
 Features:
 1. Profession & Level Agnostic: Fully configured via config.json (JOB_DATA_DIR).
-2. Dynamic Target Companies Config sync with Pipeline.md (Command Center).
+2. Dynamic Target Companies Config sync with target-companies.md.
 3. Funding News Entity Extractor: Scrapes news sources (TechCrunch, Crunchbase News, VentureBeat, etc.), 
-   extracts funded startup names, and appends them to Pipeline.md under Target Companies Config.
+   extracts funded startup names, and appends them to target-companies.md under Target Companies Config.
 4. Multi-Strategy Career Discovery:
    - Strategy A: Direct ATS APIs (Ashby, Greenhouse, Lever, etc.)
    - Strategy B: Direct Website Career Page Scraping.
@@ -55,6 +55,7 @@ if not os.path.exists(CONFIG_FILE):
 
 PROFILE_FILE = os.path.join(DATA_DIR, "Profile.md")
 PIPELINE_FILE = os.path.join(DATA_DIR, "Pipeline.md")
+TARGET_COMPANIES_FILE = os.path.join(DATA_DIR, "target-companies.md")
 JOB_LEADS_FILE = os.path.join(DATA_DIR, "job-leads.md")
 STEP1_FILE = os.path.join(DATA_DIR, "step1.md")
 STEP2_FILE = os.path.join(DATA_DIR, "step2.md")
@@ -114,30 +115,24 @@ def sanitize_text(text):
     clean = str(text).replace("|", " / ").replace("\n", " ").replace("\r", "")
     return re.sub(r'\s+', ' ', clean).strip()
 
-def parse_target_companies_from_pipeline():
+def parse_target_companies_from_pipeline(file_path=None):
+    if file_path is None:
+        file_path = TARGET_COMPANIES_FILE
     target_companies = []
-    content = read_file(PIPELINE_FILE)
+    content = read_file(file_path)
     if not content:
         return target_companies
 
-    in_target_section = False
     for line in content.splitlines():
         line_s = line.strip()
-        if "### 🎯 Target Companies Config" in line_s:
-            in_target_section = True
-            continue
-        elif line_s.startswith("## ") or (in_target_section and line_s.startswith("### ")):
-            in_target_section = False
-            continue
-
-        if in_target_section and line_s.startswith("|") and not line_s.startswith("| :---"):
+        if line_s.startswith("|") and not line_s.startswith("| :---"):
             cols = [c.strip() for c in line_s.split("|")[1:-1]]
             if len(cols) >= 3:
                 comp_raw = cols[0].replace("**", "").strip()
                 reason = cols[1].strip()
                 website = cols[2].strip()
                 ats_info = cols[3].strip() if len(cols) >= 4 else "Auto"
-                if "Company" in comp_raw or "---" in comp_raw:
+                if comp_raw.lower() in ("company", "name") or "---" in comp_raw or not comp_raw:
                     continue
 
                 ats_type = "Auto"
@@ -163,27 +158,24 @@ def parse_target_companies_from_pipeline():
 
     return target_companies
 
+# Alias for backwards compatibility
+parse_target_companies = parse_target_companies_from_pipeline
+
 def append_new_target_company_to_pipeline(comp_name, reason, website, ats_info="Auto"):
-    content = read_file(PIPELINE_FILE)
-    if not content or "### 🎯 Target Companies Config" not in content:
-        return False
+    content = read_file(TARGET_COMPANIES_FILE)
+    if not content:
+        content = "# 🎯 Target Companies Config\n\n| Company | Source / Reason | Website / Career Link | ATS / Platform | Status / Last Checked |\n| :--- | :--- | :--- | :--- | :--- |\n"
 
     comp_norm = comp_name.lower().strip()
     if comp_norm in content.lower():
         return False
 
     new_row = f"| **{comp_name}** | {reason} | {website} | {ats_info} | Added via News Sync |\n"
-    
-    parts = content.split("### 🎯 Target Companies Config\n")
-    if len(parts) == 2:
-        table_lines = parts[1].split("\n\n")[0]
-        updated_table = table_lines + "\n" + new_row.strip()
-        updated_content = parts[0] + "### 🎯 Target Companies Config\n" + parts[1].replace(table_lines, updated_table, 1)
-        with open(PIPELINE_FILE, "w", encoding="utf-8") as f:
-            f.write(updated_content)
-        logger.info(f"Auto-added new funded company to Pipeline.md: {comp_name} ({reason})")
-        return True
-    return False
+    updated_content = content.rstrip() + "\n" + new_row
+    with open(TARGET_COMPANIES_FILE, "w", encoding="utf-8") as f:
+        f.write(updated_content)
+    logger.info(f"Auto-added new funded company to target-companies.md: {comp_name} ({reason})")
+    return True
 
 AGGREGATOR_DOMAINS = {
     "techcrunch.com", "venturebeat.com", "crunchbase.com", "pitchbook.com",
@@ -344,12 +336,12 @@ def resolve_company_domain(company_name, news_context, article_url=None):
 
 def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website, ats_info="N/A", article_url=None, max_new_companies=100, current_session_count=0):
     if current_session_count >= max_new_companies:
-        logger.warning(f"Reached max session limit of {max_new_companies} new companies added to Pipeline.md.")
+        logger.warning(f"Reached max session limit of {max_new_companies} new companies added to target-companies.md.")
         return False, current_session_count
 
-    content = read_file(PIPELINE_FILE)
-    if not content or "### 🎯 Target Companies Config" not in content:
-        return False, current_session_count
+    content = read_file(TARGET_COMPANIES_FILE)
+    if not content:
+        content = "# 🎯 Target Companies Config\n\n| Company | Source / Reason | Website / Career Link | ATS / Platform | Status / Last Checked |\n| :--- | :--- | :--- | :--- | :--- |\n"
 
     comp_norm = comp_name.lower().strip()
     if comp_norm in content.lower():
@@ -368,18 +360,12 @@ def append_new_target_company_to_pipeline_with_limit(comp_name, reason, website,
         ats_info = "N/A"
 
     new_row = f"| **{comp_name}** | {source_reason} | {website} | {ats_info} | {status_notes} |\n"
-    
-    parts = content.split("### 🎯 Target Companies Config\n")
-    if len(parts) == 2:
-        table_lines = parts[1].split("\n\n")[0]
-        updated_table = table_lines + "\n" + new_row.strip()
-        updated_content = parts[0] + "### 🎯 Target Companies Config\n" + parts[1].replace(table_lines, updated_table, 1)
-        with open(PIPELINE_FILE, "w", encoding="utf-8") as f:
-            f.write(updated_content)
-        current_session_count += 1
-        logger.info(f"Auto-added new funded company to Pipeline.md ({current_session_count}/{max_new_companies}): {comp_name} ({website})")
-        return True, current_session_count
-    return False, current_session_count
+    updated_content = content.rstrip() + "\n" + new_row
+    with open(TARGET_COMPANIES_FILE, "w", encoding="utf-8") as f:
+        f.write(updated_content)
+    current_session_count += 1
+    logger.info(f"Auto-added new funded company to target-companies.md ({current_session_count}/{max_new_companies}): {comp_name} ({website})")
+    return True, current_session_count
 
 def parse_article_date(date_str):
     if not date_str:
@@ -1406,13 +1392,13 @@ def is_already_considered(job, excluded_urls, excluded_job_ids, excluded_company
 # --- Pipeline Phase Functions (Exposed for Debug Harness & Engine Execution) ---
 
 def collect_all_raw_jobs(config, max_new_companies=100):
-    """Step 1: Discover companies from funding news, sync Pipeline.md, and run multi-probe discovery across target companies and web feeds."""
+    """Step 1: Discover companies from funding news, sync target-companies.md, and run multi-probe discovery across target companies and web feeds."""
     news_sources = config.get("funding_news_sources", [])
     filter_criteria = config.get("filter_criteria", {})
     direct_keywords = filter_criteria.get("direct_career_site_keywords", [])
     max_pages = config.get("max_pages_per_source", 5)
 
-    # 1. Scrape funding news, resolve domains, and update target companies in Pipeline.md (capped at max_new_companies)
+    # 1. Scrape funding news, resolve domains, and update target companies in target-companies.md (capped at max_new_companies)
     extract_funding_news_and_update_targets(
         news_sources,
         max_new_companies=max_new_companies,
@@ -1420,9 +1406,9 @@ def collect_all_raw_jobs(config, max_new_companies=100):
         filter_criteria=filter_criteria
     )
 
-    # 2. Parse target companies from Pipeline.md
+    # 2. Parse target companies from target-companies.md
     target_companies = parse_target_companies_from_pipeline()
-    logger.info(f"Loaded {len(target_companies)} target companies from Pipeline.md.")
+    logger.info(f"Loaded {len(target_companies)} target companies from target-companies.md.")
 
     raw_jobs = []
 

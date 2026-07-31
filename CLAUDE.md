@@ -6,7 +6,7 @@
 ## Execution Rules for AI Assistants (Antigravity, Claude Code, Cursor, etc.)
 - **No direct user python calls required**: AI CLI tools execute the python engine script automatically using the repository's virtual environment.
 - **Python Interpreter**: Always run scripts using the project's virtual environment: `.venv/bin/python`.
-- **Data Location Configuration**: All data file locations (`Profile.md`, `Pipeline.md`, `config.json`, `job-leads.md`, `logs/`) are resolved dynamically via the root `.env` file (`JOB_DATA_DIR`).
+- **Data Location Configuration**: All data file locations (`Profile.md`, `Pipeline.md`, `target-companies.md`, `config.json`, `job-leads.md`, `logs/`) are resolved dynamically via the root `.env` file (`JOB_DATA_DIR`).
 - **Git Branching Strategy**: Always make feature/functionality changes in a separate branch (which can later be merged into `main`) to keep `main` clean and functional at all times. Direct commits/edits to `main` are ONLY allowed when explicitly instructed.
 
 ## Key Commands
